@@ -18,7 +18,10 @@ copy /y installer\THIRD-PARTY-NOTICES.txt installer\staged\ >nul
 for /f "tokens=2" %%v in ('findstr /r "^version" Cargo.toml') do set PKGVER=%%v
 set PKGVER=%PKGVER:"=%
 
+wix eula accept wix7 >nul 2>&1
+
 wix build -arch x64 ^
+  -ext WixToolset.Util.wixext ^
   -define PkgVersion=%PKGVER% ^
   -define BinDir="%~dp0staged" ^
   -out installer\PlayPlugin.msi ^

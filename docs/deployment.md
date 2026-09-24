@@ -41,6 +41,17 @@ auto_install = false      # true 时验证通过后静默重装
 插件校验 MSI 的 Authenticode 签名后才允许安装（`auto_install=false` 时仅向页面
 广播 `app.updateAvailable`）。
 
+## 卸载
+
+控制面板"卸载"或 `msiexec /x PlayPlugin.msi /qn`：
+
+- 自动结束插件进程（托盘应用直接终止）、移除程序文件、FFmpeg DLL、
+  自启动注册表项和 `HKCU\Software\PlayPlugin`。
+- **保留** `%APPDATA%\PlayPlugin\`（配置/日志/抓图/崩溃转储）——重装后配置
+  自动生效；需要彻底清理请手动删除该目录。
+
+升级 = 新 MSI 静默安装（同 UpgradeCode 自动 MajorUpgrade，进程自动关闭）。
+
 ## 数据目录
 
 ```
