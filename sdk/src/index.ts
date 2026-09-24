@@ -2,7 +2,7 @@
  * PlayPlugin TypeScript SDK.
  *
  * ```ts
- * import { detectPlugin, OverlayPlayer, downloadUrl } from "@playplugin/sdk";
+ * import { detectPlugin, OverlayPlayer, downloadUrl } from "playplugin-sdk";
  *
  * const info = await detectPlugin();
  * if (!info) { showDownloadBanner(downloadUrl); }

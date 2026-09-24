@@ -1,4 +1,4 @@
-# @playplugin/sdk
+# playplugin-sdk
 
 网页端 SDK：检测本地 PlayPlugin 插件、与其本地 WebSocket 通信、把网页占位元素
 `mount` 映射为原生 Overlay 悬浮窗（自动跟随滚动/缩放/全屏/DPI）。
@@ -6,13 +6,13 @@
 ## 安装
 
 ```bash
-pnpm add @playplugin/sdk
+pnpm add playplugin-sdk
 ```
 
 ## 快速开始
 
 ```ts
-import { detectPlugin, OverlayPlayer, setDownloadUrl } from "@playplugin/sdk";
+import { detectPlugin, OverlayPlayer, setDownloadUrl } from "playplugin-sdk";
 
 setDownloadUrl("/downloads/PlayPlugin.msi");
 

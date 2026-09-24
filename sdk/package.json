@@ -1,7 +1,7 @@
 {
-  "name": "@playplugin/sdk",
+  "name": "playplugin-sdk",
   "version": "0.1.0",
-  "description": "TypeScript SDK for the PlayPlugin native overlay player (RTSP/FLV/HLS, H.264/H.265) for web pages.",
+  "description": "PlayPlugin TypeScript SDK for the PlayPlugin native overlay player (RTSP/FLV/HLS, H.264/H.265) for web pages.",
   "type": "module",
   "main": "./dist/index.js",
   "types": "./dist/index.d.ts",
@@ -23,5 +23,10 @@
     "typescript": "^5.6.0",
     "vitest": "^2.1.0"
   },
-  "license": "LGPL-2.1-or-later"
+  "license": "LGPL-2.1-or-later",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/JianWWW/play-plugin.git",
+    "directory": "sdk"
+  }
 }
