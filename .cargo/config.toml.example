@@ -1,0 +1,6 @@
+# Copy to .cargo/config.toml and adjust to your machine.
+# FFmpeg shared dev build (headers + import libs + DLLs), e.g. from
+# https://www.gyan.dev/ffmpeg/builds/ (full_build-shared).
+[env]
+FFMPEG_DIR = "C:\\path\\to\\ffmpeg-9.0-full_build-shared"
+LIBCLANG_PATH = "C:\\Program Files\\LLVM\\bin"

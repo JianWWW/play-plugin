@@ -1,0 +1,22 @@
+[package]
+name = "plugin-server"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+plugin-core = { path = "../core" }
+plugin-overlay = { path = "../overlay" }
+image = { workspace = true }
+tokio = { workspace = true }
+axum = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+toml = { workspace = true }
+tracing = { workspace = true }
+anyhow = { workspace = true }
+futures-util = { workspace = true }
+
+[dev-dependencies]
+tracing-subscriber = { workspace = true }
+tokio-tungstenite = "0.21"

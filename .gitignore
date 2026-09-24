@@ -1,0 +1,10 @@
+/target
+/.deps
+node_modules
+dist
+*.dmp
+*.log
+.cargo/config.toml
+installer/staged
+.playwright-mcp
+sdk/.pnpm-store

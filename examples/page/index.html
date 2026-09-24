@@ -1,0 +1,87 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<title>PlayPlugin 手动测试页</title>
+<style>
+  body { font-family: system-ui, sans-serif; background: #111; color: #eee; margin: 2rem; }
+  .grid { display: grid; grid-template-columns: repeat(4, 1fr); gap: 12px; }
+  .cam { aspect-ratio: 16/9; background: #222; border: 1px dashed #555; position: relative; }
+  .cam .tag { position: absolute; left: 6px; top: 6px; font-size: 12px; color: #9cf; z-index: 3; }
+  .cam .ctrl { position: absolute; right: 6px; bottom: 6px; z-index: 3; }
+  #banner { background: #7a2020; padding: 12px; border-radius: 8px; margin-bottom: 1rem; display: none; }
+  #banner a { color: #fff; }
+  button { padding: 4px 10px; }
+  input { width: 40ch; }
+</style>
+</head>
+<body>
+<div id="banner">
+  未检测到 PlayPlugin。<a id="dl" href="/play-plugin/PlayPlugin.msi">点击下载安装</a>，安装后本页会自动连接。
+</div>
+<h2>PlayPlugin Overlay 手动测试</h2>
+<p>
+  <input id="url" value="rtsp://admin:password@192.168.1.64:554/Streaming/Channels/101">
+  <button id="open1">打开 1 路</button>
+  <button id="open4">打开 4 路</button>
+  <button id="closeAll">全部关闭</button>
+  <button id="conceal">隐藏浮层 2 秒</button>
+</p>
+<div class="grid" id="grid"></div>
+<pre id="log" style="color:#9f9"></pre>
+
+<script type="module">
+  // 手动测试时用 vite/静态服务直接引 src：
+  //   cd sdk && npx tsc && 在页面 import "./sdk/dist/index.js"
+  import { detectPlugin, OverlayPlayer, downloadUrl } from "../../sdk/dist/index.js";
+
+  const log = (m) => { document.getElementById("log").textContent += m + "\n"; };
+  const players = [];
+  const grid = document.getElementById("grid");
+  document.getElementById("dl").href = downloadUrl;
+
+  const info = await detectPlugin();
+  if (!info) {
+    document.getElementById("banner").style.display = "block";
+  } else {
+    log(`插件已安装: v${info.version}, protocol=${info.protocol}`);
+  }
+
+  function makeCam(i) {
+    const div = document.createElement("div");
+    div.className = "cam";
+    div.innerHTML = `<span class="tag">cam-${i}</span><span class="ctrl"><button>抓图</button></span>`;
+    grid.appendChild(div);
+    return div;
+  }
+
+  async function open(n) {
+    await closeAll();
+    const url = document.getElementById("url").value;
+    for (let i = 0; i < n; i++) {
+      const cam = makeCam(i);
+      const p = new OverlayPlayer({ url, mount: cam, muted: true });
+      p.on("state", (s) => log(`cam-${i} state=${s.state} ${s.message ?? ""}`));
+      p.on("info", (s) => log(`cam-${i} ${s.width}x${s.height} ${s.codec} [${s.decoder}]`));
+      p.on("stats", (s) => { cam.querySelector(".tag").textContent = `cam-${i} ${s.fps.toFixed(1)}fps ${s.decoder}`; });
+      cam.querySelector("button").onclick = async () => log("snapshot: " + await p.snapshot());
+      players.push(p);
+      await p.open();
+    }
+  }
+
+  async function closeAll() {
+    for (const p of players.splice(0)) await p.close();
+    grid.innerHTML = "";
+  }
+
+  document.getElementById("open1").onclick = () => open(1);
+  document.getElementById("open4").onclick = () => open(4);
+  document.getElementById("closeAll").onclick = closeAll;
+  document.getElementById("conceal").onclick = () => {
+    for (const p of players) p.conceal();
+    setTimeout(() => { for (const p of players) p.reveal(); }, 2000);
+  };
+</script>
+</body>
+</html>

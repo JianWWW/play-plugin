@@ -1,0 +1,72 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  PlayPlugin MSI (WiX Toolset v4).
+  默认 per-user 安装（免 UAC）；企业 GPO/SCCM 静默部署可用 per-machine 变换或直接
+  传递 ORIGINS 属性预置 Origin 白名单：
+
+    msiexec /i PlayPlugin.msi /qn ORIGINS="https://player.example.com;https://intra.example.com"
+-->
+<Wix xmlns="http://wixtoolset.org/schemas/v4/wxs" xmlns:ca="http://wixtoolset.org/schemas/v4/wxs/customaction">
+  <Package
+      Name="PlayPlugin"
+      Manufacturer="PlayPlugin Project"
+      Version="$(var.PkgVersion)"
+      UpgradeCode="A8B7C6D5-4E3F-4A2B-9C1D-0F1E2D3C4B5A"
+      Scope="perUserOrMachine"
+      Compressed="yes">
+
+    <MajorUpgrade DowngradeErrorMessage="已安装更新版本 ([CurrentVersion])。" />
+    <MediaTemplate EmbedCab="yes" />
+
+    <!-- 静默安装时预置 Origin 白名单（分号分隔） -->
+    <Property Id="ORIGINS" Secure="yes" />
+
+    <StandardDirectory Id="ProgramFiles6432Folder">
+      <Directory Id="INSTALLFOLDER" Name="PlayPlugin" />
+    </StandardDirectory>
+    <StandardDirectory Id="LocalAppDataFolder">
+      <Directory Id="UserDataFolder" Name="PlayPlugin" />
+    </StandardDirectory>
+
+    <Feature Id="Main" Level="1">
+      <ComponentGroupRef Id="Binaries" />
+    </Feature>
+
+    <ComponentGroup Id="Binaries" Directory="INSTALLFOLDER">
+      <Component Id="MainExe" Guid="1A2B3C4D-5E6F-4A7B-8C9D-0E1F2A3B4C5D">
+        <File Id="play_plugin.exe" Source="$(var.BinDir)\play-plugin.exe" KeyPath="yes" />
+        <RegistryValue Root="HKCU" Key="Software\PlayPlugin" Name="InstallPath"
+                       Type="string" Value="[INSTALLFOLDER]play-plugin.exe" KeyPath="no" />
+        <!-- 开机自启动（用户级） -->
+        <RegistryValue Root="HKCU" Key="Software\Microsoft\Windows\CurrentVersion\Run"
+                       Name="PlayPlugin" Type="string"
+                       Value="&quot;[INSTALLFOLDER]play-plugin.exe&quot;" />
+      </Component>
+
+      <!-- FFmpeg LGPL 动态库（见 THIRD-PARTY-NOTICES；DLL 保持可替换） -->
+      <Component Id="FFmpegDlls" Guid="2B3C4D5E-6F7A-4B8C-9D0E-1F2A3B4C5D6E">
+        <File Source="$(var.BinDir)\avcodec-63.dll" />
+        <File Source="$(var.BinDir)\avdevice-63.dll" />
+        <File Source="$(var.BinDir)\avfilter-12.dll" />
+        <File Source="$(var.BinDir)\avformat-63.dll" />
+        <File Source="$(var.BinDir)\avutil-61.dll" />
+        <File Source="$(var.BinDir)\swresample-7.dll" />
+        <File Source="$(var.BinDir)\swscale-10.dll" />
+      </Component>
+
+      <Component Id="Notices" Guid="3C4D5E6F-7A8B-4C9D-0E1F-2A3B4C5D6E7F">
+        <File Source="$(var.BinDir)\THIRD-PARTY-NOTICES.txt" />
+      </Component>
+    </ComponentGroup>
+
+    <!-- 安装完成后写白名单并启动插件 -->
+    <CustomAction Id="WriteConfig"
+                  FileRef="play_plugin.exe"
+                  ExeCommand="--write-config --origins &quot;[ORIGINS]&quot;"
+                  Return="asyncNoWait"
+                  Impersonate="yes" />
+    <InstallExecuteSequence>
+      <Custom Action="WriteConfig" After="InstallFinalize" Condition='ORIGINS &lt;&gt; ""' />
+    </InstallExecuteSequence>
+  </Package>
+</Wix>

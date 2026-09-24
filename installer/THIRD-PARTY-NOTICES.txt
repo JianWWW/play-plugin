@@ -1,0 +1,18 @@
+PlayPlugin — third-party notices
+================================
+
+This application uses FFmpeg (https://ffmpeg.org) under the GNU Lesser General
+Public License v2.1 or later, dynamically linked. The FFmpeg DLLs shipped with
+this installer (avcodec-63.dll, avformat-63.dll, avutil-61.dll, swresample-7.dll,
+swscale-10.dll, avdevice-63.dll, avfilter-12.dll) can be replaced to exercise the
+"install a newer/modified FFmpeg" freedom granted by the LGPL.
+
+FFmpeg source code: https://ffmpeg.org/download.html
+FFmpeg license: https://www.ffmpeg.org/legal.html (LGPL-2.1-or-later)
+Corresponding source for the exact build shipped: see the build provenance
+file published alongside the installer.
+
+This software also uses the Rust crates listed in Cargo.lock (MIT/Apache-2.0
+dual-licensed unless noted otherwise) and windows-rs (MIT/Apache-2.0).
+Their licenses are reproduced in the source repository and in the CI artifact
+"third-party-license-report".

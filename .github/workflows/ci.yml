@@ -1,0 +1,101 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  rust:
+    runs-on: windows-latest
+    env:
+      LIBCLANG_PATH: "C:\\Program Files\\LLVM\\bin"
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install LLVM (libclang for ffmpeg-sys-next bindgen)
+        run: choco install llvm -y --no-progress
+
+      - name: Fetch FFmpeg shared dev build
+        shell: pwsh
+        run: ./installer/fetch-ffmpeg.ps1
+
+      - name: Set FFMPEG_DIR
+        run: |
+          dir=$(ls -d "$PWD/.deps/ffmpeg/"ffmpeg-*full_build-shared)
+          echo "FFMPEG_DIR=$dir" >> "$GITHUB_ENV"
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Format
+        run: cargo fmt --all -- --check
+
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+      - name: Tests
+        run: cargo test --workspace
+
+      - name: License audit
+        run: |
+          cargo install cargo-deny --locked || true
+          cargo deny check licenses
+
+      - name: Copy FFmpeg DLLs next to binaries (runtime)
+        if: always()
+        run: cp .deps/ffmpeg/*/bin/*.dll target/debug/ 2>/dev/null || true
+
+  sdk:
+    runs-on: windows-latest
+    defaults:
+      run:
+        working-directory: sdk
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 9
+      - run: pnpm install --frozen-lockfile=false
+      - run: npx tsc -p tsconfig.json --noEmit
+      - run: node node_modules/vitest/vitest.mjs run
+
+  release:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [rust, sdk]
+    runs-on: windows-latest
+    env:
+      LIBCLANG_PATH: "C:\\Program Files\\LLVM\\bin"
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install LLVM
+        run: choco install llvm -y --no-progress
+      - name: Fetch FFmpeg
+        shell: pwsh
+        run: ./installer/fetch-ffmpeg.ps1
+      - name: Set FFMPEG_DIR
+        run: |
+          dir=$(ls -d "$PWD/.deps/ffmpeg/"ffmpeg-*full_build-shared)
+          echo "FFMPEG_DIR=$dir" >> "$GITHUB_ENV"
+      - name: Build release
+        run: cargo build --release -p plugin-app
+      - name: Stage + build MSI
+        shell: cmd
+        run: installer\build.cmd
+      - name: Sign MSI (requires secrets)
+        if: env.SIGNTOOL_PFX != ''
+        shell: cmd
+        run: signtool sign /fd SHA256 /f "%SIGNTOOL_PFX%" /p "%SIGNTOOL_PASS%" installer\PlayPlugin.msi
+        env:
+          SIGNTOOL_PFX: ${{ secrets.SIGNTOOL_PFX }}
+          SIGNTOOL_PASS: ${{ secrets.SIGNTOOL_PASS }}
+      - uses: actions/upload-artifact@v4
+        with:
+          name: PlayPlugin-msi
+          path: installer/PlayPlugin.msi
