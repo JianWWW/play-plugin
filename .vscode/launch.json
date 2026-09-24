@@ -1,0 +1,44 @@
+{
+  "version": "0.2.0",
+  "configurations": [
+    {
+      "name": "调试: 启动插件 (MSVC 调试器)",
+      "type": "cppvsdb",
+      "request": "launch",
+      "program": "${workspaceFolder}/target/debug/play-plugin.exe",
+      "args": [],
+      "cwd": "${workspaceFolder}",
+      "env": {
+        "RUST_LOG": "debug",
+        "FFMPEG_DIR": "${workspaceFolder}\\.deps\\ffmpeg\\ffmpeg-9.0.2-full_build-shared"
+      },
+      "console": "integratedTerminal"
+    },
+    {
+      "name": "调试: --smoke 自检",
+      "type": "cppvsdb",
+      "request": "launch",
+      "program": "${workspaceFolder}/target/debug/play-plugin.exe",
+      "args": ["--smoke"],
+      "cwd": "${workspaceFolder}",
+      "env": { "RUST_LOG": "debug" },
+      "console": "integratedTerminal"
+    },
+    {
+      "name": "调试: 附加到运行中的插件",
+      "type": "cppvsdb",
+      "request": "attach",
+      "processId": "${command:pickProcess}"
+    },
+    {
+      "name": "调试: 启动插件 (CodeLLDB)",
+      "type": "lldb",
+      "request": "launch",
+      "program": "${workspaceFolder}/target/debug/play-plugin.exe",
+      "args": [],
+      "cwd": "${workspaceFolder}",
+      "env": { "RUST_LOG": "debug" },
+      "sourceMap": { "${workspaceFolder}": "${workspaceFolder}" }
+    }
+  ]
+}

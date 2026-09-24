@@ -1,5 +1,9 @@
 //! play-plugin.exe — plugin process entry point.
 
+// Release builds are GUI-subsystem (no console flash on login autostart);
+// debug builds keep the console so `cargo run` shows logs directly.
+#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
+
 mod crash;
 mod instance;
 mod tray;
@@ -169,7 +173,7 @@ fn smoke_test(_config: plugin_server::config::Config) -> anyhow::Result<()> {
     let nonblack = frame
         .data
         .chunks_exact(4)
-        .filter(|p| p[0] + p[1] + p[2] > 60)
+        .filter(|p| u16::from(p[0]) + u16::from(p[1]) + u16::from(p[2]) > 60)
         .count();
     let white = frame
         .data
@@ -205,17 +209,30 @@ fn build_toml(config: &plugin_server::config::Config) -> String {
 }
 
 fn init_logging(data_dir: &std::path::Path, level: &str) -> anyhow::Result<WorkerGuard> {
+    use tracing_subscriber::layer::{Layer as _, SubscriberExt};
+    use tracing_subscriber::util::SubscriberInitExt;
     std::fs::create_dir_all(data_dir.join("logs"))?;
     let (writer, guard) = tracing_appender::non_blocking(tracing_appender::rolling::daily(
         data_dir.join("logs"),
         "play-plugin.log",
     ));
-    let filter = tracing_subscriber::EnvFilter::try_new(level)
+    // RUST_LOG beats config.toml so `RUST_LOG=debug` just works while debugging.
+    let filter = tracing_subscriber::EnvFilter::try_from_default_env()
+        .or_else(|_| tracing_subscriber::EnvFilter::try_new(level))
         .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"));
-    tracing_subscriber::fmt()
-        .with_env_filter(filter)
-        .with_writer(writer)
+    // Console mirror for debugging: always in debug builds, opt-in otherwise.
+    let console = cfg!(debug_assertions) || std::env::var_os("PLAY_PLUGIN_CONSOLE").is_some();
+    let file_layer = tracing_subscriber::fmt::layer()
         .with_ansi(false)
-        .init();
+        .with_writer(writer)
+        .with_filter(filter.clone());
+    if console {
+        tracing_subscriber::registry()
+            .with(file_layer)
+            .with(tracing_subscriber::fmt::layer().with_filter(filter))
+            .init();
+    } else {
+        tracing_subscriber::registry().with(file_layer).init();
+    }
     Ok(guard)
 }

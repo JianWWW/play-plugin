@@ -27,7 +27,7 @@ Windows 原生浏览器播放插件：网页 Overlay 悬浮窗播放 RTSP / HTTP
 | `crates/app` | 托盘、单实例、崩溃 minidump、自动更新（Authenticode 验签）、`--smoke` 自检 |
 | `sdk/` | `playplugin-sdk`：探测/下载引导、流生命周期、rect 同步（滚动/缩放/F11/DPI）、自动重连 |
 | `installer/` | WiX MSI（静默部署、ORIGINS 预置）、FFmpeg 获取脚本、LGPL 声明 |
-| `docs/` | [信令协议](docs/protocol.md)、[部署手册](docs/deployment.md) |
+| `docs/` | [信令协议](docs/protocol.md)、[部署手册](docs/deployment.md)、[调试指南](docs/debugging.md) |
 
 ## 本地开发
 
