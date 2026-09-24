@@ -125,8 +125,9 @@ pub fn redact_url(url: &str) -> String {
             s = format!("{}***@{}", &s[..scheme_end + 3], &rest[at_in_host + 1..]);
         }
     }
-    const SENSITIVE: [&str; 8] =
-        ["key", "token", "password", "passwd", "pwd", "secret", "sign", "auth"];
+    const SENSITIVE: [&str; 8] = [
+        "key", "token", "password", "passwd", "pwd", "secret", "sign", "auth",
+    ];
     if let Some((base, query)) = s.split_once('?') {
         let masked: Vec<String> = query
             .split('&')
