@@ -114,19 +114,34 @@ pub fn new_drop_counter() -> DropCounter {
     Arc::new(AtomicU64::new(0))
 }
 
-/// Strips `user:pass@` credentials from a URL so it can safely appear in logs.
+/// Strips `user:pass@` credentials and sensitive query values (`key=`,
+/// `token=`, …) from a URL so it can safely appear in logs.
 pub fn redact_url(url: &str) -> String {
-    if let Some(scheme_end) = url.find("://") {
-        let rest = &url[scheme_end + 3..];
-        if rest.find('@').is_some() {
-            // Only redact if an '@' appears before the first '/'.
-            let host_part = rest.split('/').next().unwrap_or("");
-            if let Some(at_in_host) = host_part.rfind('@') {
-                return format!("{}***@{}", &url[..scheme_end + 3], &rest[at_in_host + 1..]);
-            }
+    let mut s = url.to_string();
+    if let Some(scheme_end) = s.find("://") {
+        let rest = &s[scheme_end + 3..];
+        let host_part = rest.split('/').next().unwrap_or("");
+        if let Some(at_in_host) = host_part.rfind('@') {
+            s = format!("{}***@{}", &s[..scheme_end + 3], &rest[at_in_host + 1..]);
         }
     }
-    url.to_string()
+    const SENSITIVE: [&str; 8] =
+        ["key", "token", "password", "passwd", "pwd", "secret", "sign", "auth"];
+    if let Some((base, query)) = s.split_once('?') {
+        let masked: Vec<String> = query
+            .split('&')
+            .map(|pair| {
+                let (k, _v) = pair.split_once('=').unwrap_or((pair, ""));
+                if SENSITIVE.iter().any(|s| k.eq_ignore_ascii_case(s)) {
+                    format!("{k}=***")
+                } else {
+                    pair.to_string()
+                }
+            })
+            .collect();
+        s = format!("{}?{}", base, masked.join("&"));
+    }
+    s
 }
 
 #[cfg(test)]
@@ -144,5 +159,18 @@ mod tests {
             "rtsp://cam.local/stream"
         );
         assert_eq!(redact_url("http://a@b.com/x"), "http://***@b.com/x");
+    }
+
+    #[test]
+    fn redacts_query_tokens() {
+        assert_eq!(
+            redact_url("rtsp://cam:9068/1?key=abc123&appId=42&t=123"),
+            "rtsp://cam:9068/1?key=***&appId=42&t=123"
+        );
+        assert_eq!(
+            redact_url("rtsp://cam/?TOKEN=x&Key=y"),
+            "rtsp://cam/?TOKEN=***&Key=***"
+        );
+        assert_eq!(redact_url("rtsp://cam/?plain=1"), "rtsp://cam/?plain=1");
     }
 }

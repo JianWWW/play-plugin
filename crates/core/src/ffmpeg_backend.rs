@@ -25,6 +25,9 @@ use ffmpeg_next as ffmpeg;
 const BACKOFF_SECS: [f32; 5] = [0.5, 1.0, 2.0, 4.0, 8.0];
 /// A connection that lived this long is considered healthy → reset backoff.
 const BACKOFF_RESET_AFTER: Duration = Duration::from_secs(30);
+/// No packet for this long (TCP may still be alive via keep-alive) → treat as
+/// a stalled stream and reconnect. Cameras/platforms go silent all the time.
+const STALL_TIMEOUT: Duration = Duration::from_secs(15);
 
 pub fn spawn(
     opts: StreamOptions,
@@ -219,12 +222,14 @@ fn run_once(
     let mut decoded: u64 = 0;
     let mut bytes_window: u64 = 0;
     let mut stat_t = Instant::now();
+    let mut last_packet = Instant::now();
 
     let result = (|| -> anyhow::Result<()> {
         for (stream, packet) in ictx.packets() {
             if close.load(Ordering::Relaxed) {
                 return Ok(());
             }
+            last_packet = Instant::now();
             bytes_window += packet.size() as u64;
             let idx = stream.index();
             if idx == v_index {
@@ -284,6 +289,14 @@ fn run_once(
                 decoded = 0;
                 bytes_window = 0;
                 stat_t = Instant::now();
+            }
+            // Stall watchdog: av_read_frame blocks forever on a silent but
+            // keep-alived connection; force a reconnect instead.
+            if last_packet.elapsed() >= STALL_TIMEOUT {
+                return Err(anyhow::anyhow!(
+                    "stream stalled (no data for {}s)",
+                    STALL_TIMEOUT.as_secs()
+                ));
             }
         }
         Err(anyhow::anyhow!("stream ended (EOF)"))
