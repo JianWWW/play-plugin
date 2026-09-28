@@ -5,7 +5,7 @@
 #   .\dev.ps1 -Smoke     只跑 --smoke 自检（无需浏览器）
 param([switch]$Stop, [switch]$Smoke)
 $ErrorActionPreference = "Continue"
-$root = Split-Path -Parent $PSScriptRoot
+$root = $PSScriptRoot   # dev.ps1 在仓库根目录
 
 function Stop-Dev {
   Get-Process play-plugin -ErrorAction SilentlyContinue | Stop-Process -Force
