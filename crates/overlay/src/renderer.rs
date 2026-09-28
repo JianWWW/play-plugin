@@ -11,17 +11,24 @@ use windows::Win32::Graphics::Direct3D::Fxc::D3DCompile;
 use windows::Win32::Graphics::Direct3D::D3D11_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP;
 use windows::Win32::Graphics::Direct3D11::{
     ID3D11Buffer, ID3D11DeviceContext, ID3D11InputLayout, ID3D11PixelShader,
-    ID3D11RenderTargetView, ID3D11SamplerState, ID3D11ShaderResourceView, ID3D11Texture2D,
-    ID3D11VertexShader, D3D11_BIND_CONSTANT_BUFFER, D3D11_BIND_FLAG, D3D11_BIND_RENDER_TARGET,
-    D3D11_BIND_SHADER_RESOURCE, D3D11_BIND_VERTEX_BUFFER, D3D11_BUFFER_DESC,
-    D3D11_COMPARISON_NEVER, D3D11_CPU_ACCESS_READ, D3D11_FILTER_MIN_MAG_MIP_LINEAR,
-    D3D11_INPUT_ELEMENT_DESC, D3D11_INPUT_PER_VERTEX_DATA, D3D11_MAPPED_SUBRESOURCE,
-    D3D11_MAP_READ, D3D11_SAMPLER_DESC, D3D11_SUBRESOURCE_DATA, D3D11_TEXTURE2D_DESC,
-    D3D11_TEXTURE_ADDRESS_CLAMP, D3D11_USAGE_DEFAULT, D3D11_USAGE_STAGING, D3D11_VIEWPORT,
+    ID3D11RasterizerState, ID3D11RenderTargetView, ID3D11SamplerState, ID3D11ShaderResourceView, ID3D11Texture2D,
+    ID3D11VertexShader, ID3D11VideoContext, ID3D11VideoDevice, ID3D11VideoProcessor,
+    ID3D11VideoProcessorEnumerator, D3D11_BIND_CONSTANT_BUFFER, D3D11_BIND_FLAG,
+    D3D11_BIND_RENDER_TARGET, D3D11_BIND_SHADER_RESOURCE, D3D11_BIND_VERTEX_BUFFER,
+    D3D11_BUFFER_DESC, D3D11_COMPARISON_NEVER, D3D11_CPU_ACCESS_READ, D3D11_CULL_NONE,
+    D3D11_FILTER_MIN_MAG_MIP_LINEAR, D3D11_FILL_SOLID, D3D11_INPUT_ELEMENT_DESC, D3D11_INPUT_PER_VERTEX_DATA,
+    D3D11_MAPPED_SUBRESOURCE, D3D11_MAP_READ, D3D11_RASTERIZER_DESC, D3D11_SAMPLER_DESC, D3D11_SUBRESOURCE_DATA,
+    D3D11_TEX2D_VPIV, D3D11_TEX2D_VPOV, D3D11_TEXTURE2D_DESC, D3D11_TEXTURE_ADDRESS_CLAMP,
+    D3D11_USAGE_DEFAULT, D3D11_USAGE_STAGING, D3D11_VIDEO_FRAME_FORMAT_PROGRESSIVE,
+    D3D11_VIDEO_PROCESSOR_COLOR_SPACE, D3D11_VIDEO_PROCESSOR_CONTENT_DESC,
+    D3D11_VIDEO_PROCESSOR_INPUT_VIEW_DESC, D3D11_VIDEO_PROCESSOR_INPUT_VIEW_DESC_0,
+    D3D11_VIDEO_PROCESSOR_OUTPUT_VIEW_DESC, D3D11_VIDEO_PROCESSOR_OUTPUT_VIEW_DESC_0,
+    D3D11_VIDEO_PROCESSOR_STREAM, D3D11_VIDEO_USAGE_PLAYBACK_NORMAL, D3D11_VIEWPORT,
+    D3D11_VPIV_DIMENSION_TEXTURE2D, D3D11_VPOV_DIMENSION_TEXTURE2D,
 };
 use windows::Win32::Graphics::Dxgi::Common::{
     DXGI_ALPHA_MODE_IGNORE, DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_FORMAT_R32G32_FLOAT,
-    DXGI_FORMAT_UNKNOWN, DXGI_SAMPLE_DESC,
+    DXGI_FORMAT_UNKNOWN, DXGI_RATIONAL, DXGI_SAMPLE_DESC,
 };
 use windows::Win32::Graphics::Dxgi::{
     CreateDXGIFactory1, IDXGIFactory2, IDXGISwapChain1, DXGI_PRESENT, DXGI_PRESENT_TEST,
@@ -61,6 +68,8 @@ pub struct StreamView {
     rtv: Option<ID3D11RenderTargetView>,
     tex: Option<ID3D11Texture2D>,
     srv: Option<ID3D11ShaderResourceView>,
+    /// NV12→BGRA converter, rebuilt when the frame size changes.
+    vp: Option<((u32, u32), (ID3D11VideoProcessor, ID3D11VideoProcessorEnumerator))>,
     tex_size: (u32, u32),
     client: (i32, i32),
     dirty: bool,
@@ -74,6 +83,7 @@ pub struct Renderer {
     vbuf: ID3D11Buffer,
     cbuf: ID3D11Buffer,
     sampler: ID3D11SamplerState,
+    rs: ID3D11RasterizerState,
 }
 
 impl Renderer {
@@ -173,6 +183,28 @@ impl Renderer {
                 Some(&mut sampler_opt),
             )?;
             let sampler = sampler_opt.unwrap();
+            // Fullscreen quad: cull nothing — the triangle-strip winding is
+            // back-facing under D3D's Y-down front-face rule, and the default
+            // CULL_BACK rasterizer state silently dropped every quad (black
+            // window with a perfectly healthy texture behind it).
+            let mut rs_opt: Option<ID3D11RasterizerState> = None;
+            device.CreateRasterizerState(
+                &D3D11_RASTERIZER_DESC {
+                    FillMode: D3D11_FILL_SOLID,
+                    CullMode: D3D11_CULL_NONE,
+                    FrontCounterClockwise: BOOL(0),
+                    DepthBias: 0,
+                    DepthBiasClamp: 0.0,
+                    SlopeScaledDepthBias: 0.0,
+                    DepthClipEnable: BOOL(0),
+                    ScissorEnable: BOOL(0),
+                    MultisampleEnable: BOOL(0),
+                    AntialiasedLineEnable: BOOL(0),
+                    ..Default::default()
+                },
+                Some(&mut rs_opt),
+            )?;
+            let rs = rs_opt.unwrap();
 
             Ok(Renderer {
                 gpu,
@@ -182,6 +214,7 @@ impl Renderer {
                 vbuf,
                 cbuf,
                 sampler,
+                rs,
             })
         }
     }
@@ -216,6 +249,7 @@ impl Renderer {
                 rtv: None,
                 tex: None,
                 srv: None,
+                vp: None,
                 tex_size: (0, 0),
                 client: (rect.right - rect.left, rect.bottom - rect.top),
                 dirty: true,
@@ -332,14 +366,110 @@ impl Renderer {
     }
 
     fn update_frame_gpu(&self, v: &mut StreamView, src: &GpuTexture, sub: u32, w: u32, h: u32) {
+        {
+            use std::sync::atomic::{AtomicBool, Ordering};
+            static SEEN: AtomicBool = AtomicBool::new(false);
+            if !SEEN.swap(true, Ordering::Relaxed) {
+                tracing::info!(w, h, sub, "gpu frame arrived at renderer");
+            }
+        }
         self.ensure_texture(v, w, h);
         let Some(tex) = v.tex.as_ref() else { return };
+        // Decoded frames are NV12 (Y + interleaved UV planes) on a texture
+        // array; the render pipeline wants BGRA. CopySubresourceRegion
+        // cannot convert formats — use the hardware video processor.
+        if v.vp.as_ref().map(|(s, _)| *s != (w, h)).unwrap_or(true) {
+            match self.make_video_processor(w, h) {
+                Ok(p) => v.vp = Some(((w, h), p)),
+                Err(e) => {
+                    tracing::warn!(error = %e, "video processor unavailable");
+                    return;
+                }
+            }
+        }
+        let Some((_, (vp, ve))) = v.vp.as_ref() else { return };
         unsafe {
-            self.gpu
-                .context()
-                .CopySubresourceRegion(tex, 0, 0, 0, 0, src.as_raw(), sub, None);
+            use windows::core::Interface;
+            let Some(vd) = (self.gpu.device().cast::<ID3D11VideoDevice>()).ok() else {
+                return;
+            }; // views are created on the video device
+            let in_desc = D3D11_VIDEO_PROCESSOR_INPUT_VIEW_DESC {
+                FourCC: 0,
+                ViewDimension: D3D11_VPIV_DIMENSION_TEXTURE2D,
+                Anonymous: D3D11_VIDEO_PROCESSOR_INPUT_VIEW_DESC_0 {
+                    Texture2D: D3D11_TEX2D_VPIV {
+                        MipSlice: 0,
+                        ArraySlice: sub,
+                    },
+                },
+            };
+            let mut in_view = None;
+            if let Err(e) =
+                vd.CreateVideoProcessorInputView(src.as_raw(), ve, &in_desc, Some(&mut in_view))
+            {
+                tracing::warn!(error = %e, "CreateVideoProcessorInputView failed");
+                return;
+            }
+            let out_desc = D3D11_VIDEO_PROCESSOR_OUTPUT_VIEW_DESC {
+                ViewDimension: D3D11_VPOV_DIMENSION_TEXTURE2D,
+                Anonymous: D3D11_VIDEO_PROCESSOR_OUTPUT_VIEW_DESC_0 {
+                    Texture2D: D3D11_TEX2D_VPOV { MipSlice: 0 },
+                },
+            };
+            let mut out_view = None;
+            if let Err(e) = vd.CreateVideoProcessorOutputView(tex, ve, &out_desc, Some(&mut out_view))
+            {
+                tracing::warn!(error = %e, "CreateVideoProcessorOutputView failed");
+                return;
+            }
+            let Ok(vc) = self.gpu.context().cast::<ID3D11VideoContext>() else { return };
+            let _ = vc.VideoProcessorSetStreamFrameFormat(vp, 0, D3D11_VIDEO_FRAME_FORMAT_PROGRESSIVE);
+            // BT.709 studio range (bit 5 = matrix, bits 6-7 = nominal range).
+            // ponytail: calibration knob — use (2 << 6) full-range or clear bit
+            // 5 for BT.601 if colors look washed on a given camera.
+            let _ = vc.VideoProcessorSetStreamColorSpace(
+                vp,
+                0,
+                &D3D11_VIDEO_PROCESSOR_COLOR_SPACE {
+                    _bitfield: (1 << 5) | (1 << 6),
+                },
+            );
+            let mut streams = [D3D11_VIDEO_PROCESSOR_STREAM {
+                Enable: BOOL(1),
+                pInputSurface: std::mem::ManuallyDrop::new(in_view),
+                ..Default::default()
+            }];
+            let blt = vc.VideoProcessorBlt(vp, out_view.as_ref().unwrap(), 0, &streams);
+            // pInputSurface is ManuallyDrop: release the per-frame view.
+            std::mem::ManuallyDrop::drop(&mut streams[0].pInputSurface);
+            if let Err(e) = blt {
+                tracing::warn!(error = %e, "VideoProcessorBlt failed");
+            }
         }
         v.dirty = true;
+    }
+
+    fn make_video_processor(
+        &self,
+        w: u32,
+        h: u32,
+    ) -> windows::core::Result<(ID3D11VideoProcessor, ID3D11VideoProcessorEnumerator)> {
+        use windows::core::Interface;
+        let vd: ID3D11VideoDevice = self.gpu.device().cast()?;
+        let rate = DXGI_RATIONAL { Numerator: 25, Denominator: 1 };
+        let content = D3D11_VIDEO_PROCESSOR_CONTENT_DESC {
+            InputFrameFormat: D3D11_VIDEO_FRAME_FORMAT_PROGRESSIVE,
+            InputFrameRate: rate,
+            InputWidth: w,
+            InputHeight: h,
+            OutputWidth: w,
+            OutputHeight: h,
+            OutputFrameRate: rate,
+            Usage: D3D11_VIDEO_USAGE_PLAYBACK_NORMAL,
+        };
+        let ve = unsafe { vd.CreateVideoProcessorEnumerator(&content)? };
+        let vp = unsafe { vd.CreateVideoProcessor(&ve, 0)? };
+        Ok((vp, ve))
     }
 
     /// Draws the letterboxed quad and presents. Cheap when not dirty.
@@ -373,6 +503,7 @@ impl Renderer {
                 MaxDepth: 1.0,
             };
             ctx.RSSetViewports(Some(&[vp]));
+            ctx.RSSetState(&self.rs);
             ctx.ClearRenderTargetView(rtv, &[0.0, 0.0, 0.0, 1.0]);
             ctx.IASetInputLayout(&self.layout);
             ctx.IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP);

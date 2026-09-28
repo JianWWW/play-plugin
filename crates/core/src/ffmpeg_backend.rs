@@ -23,6 +23,13 @@ use ffmpeg_next as ffmpeg;
 
 /// Reconnect backoff (seconds), with jitter, capped at the last entry.
 const BACKOFF_SECS: [f32; 5] = [0.5, 1.0, 2.0, 4.0, 8.0];
+/// Consecutive hard decoder errors on the hardware path before auto-fallback
+/// to software decode (~2s of video at 25fps).
+const HW_ERR_FALLBACK: u32 = 50;
+/// Video packets consumed with zero frames out before auto-fallback — the
+/// API-visible face of corrupted (花屏) or stalled hardware decode (~15s at
+/// 25fps).
+const HW_STARVE_FALLBACK: u32 = 375;
 /// A connection that lived this long is considered healthy → reset backoff.
 const BACKOFF_RESET_AFTER: Duration = Duration::from_secs(30);
 /// No packet for this long (TCP may still be alive via keep-alive) → treat as
@@ -140,41 +147,38 @@ fn run_once(
         .unwrap_or(usize::MAX);
     let audio_params = audio_stream.map(|s| s.parameters());
 
-    // --- video decoder: hardware first, software fallback -----------------
-    let mut hw: Option<HwVideoDecoder> = None;
-    if let Some(dev) = device {
+    // --- video decoder: hardware first, auto-fallback to software ---------
+    // Stream parameters are kept around: a mid-stream hw→sw switch rebuilds
+    // the software decoder from them without dropping the connection.
+    let v_params = video_stream.parameters();
+    let mut vpath = if let Some(dev) = device {
         match HwVideoDecoder::attach(video_stream.parameters(), dev) {
             Ok(d) => {
                 info!(codec = %video_codec, "hardware decode enabled (d3d11va)");
-                hw = Some(d);
+                VPath::Hw(d)
             }
             Err(e) => {
-                warn!(codec = %video_codec, error = %e, "d3d11va unavailable, using software decode")
+                warn!(codec = %video_codec, error = %e, "d3d11va unavailable, using software decode");
+                VPath::Sw(open_sw(&v_params)?)
             }
         }
-    }
-    let mut sw = if hw.is_none() {
-        Some(
-            ffmpeg::codec::context::Context::from_parameters(video_stream.parameters())?
-                .decoder()
-                .video()?,
-        )
     } else {
-        None
+        VPath::Sw(open_sw(&v_params)?)
     };
 
-    let (v_w, v_h) = if let Some(h) = &hw {
-        (h.width, h.height)
-    } else {
-        let d = sw.as_ref().unwrap();
-        (d.width(), d.height())
+    let (v_w, v_h) = match &vpath {
+        VPath::Hw(h) => (h.width, h.height),
+        VPath::Sw(d) => (d.width(), d.height()),
     };
-    let decoder_name = if hw.is_some() { "d3d11va" } else { "sw" };
     let _ = tx.send(PipelineEvent::Info {
         codec: video_codec.clone(),
         width: v_w,
         height: v_h,
-        decoder: decoder_name.into(),
+        decoder: match &vpath {
+            VPath::Hw(_) => "d3d11va",
+            VPath::Sw(_) => "sw",
+        }
+        .into(),
     });
     let _ = tx.send(PipelineEvent::State {
         state: StreamState::Playing,
@@ -182,22 +186,11 @@ fn run_once(
         message: None,
     });
 
-    // CPU conversion context for the software path (any input → BGRA).
+    // CPU conversion for the software path (any input → BGRA); created
+    // lazily from the first decoded frame — the decoder-reported format can
+    // still be unknown at open time.
     let mut scaler: Option<ffmpeg::software::scaling::Context> = None;
-    if let Some(d) = sw.as_ref() {
-        match ffmpeg::software::scaling::Context::get(
-            d.format(),
-            d.width(),
-            d.height(),
-            ffmpeg::format::Pixel::BGRA,
-            d.width(),
-            d.height(),
-            ffmpeg::software::scaling::flag::Flags::BILINEAR,
-        ) {
-            Ok(c) => scaler = Some(c),
-            Err(e) => warn!(error = %e, "scaler init failed"),
-        }
-    }
+    let mut scaler_warned = false;
     let mut bgra = ffmpeg::util::frame::video::Video::empty();
 
     // --- audio decoder → f32 / 48kHz / stereo (optional) -------------------
@@ -220,6 +213,10 @@ fn run_once(
 
     let mut v_frame = ffmpeg::util::frame::video::Video::empty();
     let mut decoded: u64 = 0;
+    let mut hw_errs: u32 = 0; // consecutive hard errors on the hw path
+    let mut hw_starve: u32 = 0; // video packets in with no frame out
+    let mut sw_errs: u32 = 0;
+    let mut fell_back = false;
     let mut bytes_window: u64 = 0;
     let mut stat_t = Instant::now();
     let mut last_packet = Instant::now();
@@ -233,32 +230,88 @@ fn run_once(
             bytes_window += packet.size() as u64;
             let idx = stream.index();
             if idx == v_index {
-                if let Some(h) = hw.as_mut() {
-                    if h.send(&packet) {
-                        while h.receive(&mut v_frame) {
-                            decoded += 1;
-                            if let Some(f) = h.gpu_frame(&v_frame) {
-                                let _ = tx.send(PipelineEvent::Video(f));
-                            }
+                let mut fallback = false;
+                match &mut vpath {
+                    VPath::Hw(h) => {
+                        if h.send(&packet).is_err() {
+                            hw_errs += 1;
                         }
-                    }
-                } else if let Some(d) = sw.as_mut() {
-                    if d.send_packet(&packet).is_ok() {
-                        while d.receive_frame(&mut v_frame).is_ok() {
-                            decoded += 1;
-                            if let Some(sc) = scaler.as_mut() {
-                                if sc.run(&v_frame, &mut bgra).is_ok() {
-                                    let _ =
-                                        tx.send(PipelineEvent::Video(VideoFrame::Cpu(CpuFrame {
-                                            width: bgra.width(),
-                                            height: bgra.height(),
-                                            stride: bgra.stride(0),
-                                            data: Arc::new(bgra.data(0).to_vec()),
-                                        })));
+                        hw_starve += 1;
+                        loop {
+                            match h.receive(&mut v_frame) {
+                                Ok(true) => {
+                                    decoded += 1;
+                                    hw_errs = 0;
+                                    hw_starve = 0;
+                                    if let Some(f) = h.gpu_frame(&v_frame) {
+                                        let _ = tx.send(PipelineEvent::Video(f));
+                                    }
+                                }
+                                Ok(false) => break,
+                                Err(_) => {
+                                    hw_errs += 1;
+                                    break;
                                 }
                             }
                         }
+                        // Auto-switch to software when the hw path keeps
+                        // erroring, or keeps eating packets without producing
+                        // frames. Mid-stream: demux continues, no reconnect.
+                        if !fell_back
+                            && (hw_errs >= HW_ERR_FALLBACK || hw_starve >= HW_STARVE_FALLBACK)
+                        {
+                            fallback = true;
+                        }
                     }
+                    VPath::Sw(d) => {
+                        if d.send_packet(&packet).is_err() {
+                            sw_errs += 1;
+                        }
+                        loop {
+                            match d.receive_frame(&mut v_frame) {
+                                Ok(()) => {
+                                    decoded += 1;
+                                    sw_errs = 0;
+                                    emit_cpu(
+                                        &mut scaler,
+                                        &mut scaler_warned,
+                                        &v_frame,
+                                        &mut bgra,
+                                        tx,
+                                    );
+                                }
+                                Err(e) if is_transient(&e) => break,
+                                Err(_) => {
+                                    sw_errs += 1;
+                                    break;
+                                }
+                            }
+                        }
+                        // Software is the last rung — if it fails too, error
+                        // out so the reconnect loop starts over (fresh hw
+                        // attempt included).
+                        if sw_errs >= HW_ERR_FALLBACK {
+                            return Err(anyhow::anyhow!("software decode failing"));
+                        }
+                    }
+                }
+                if fallback {
+                    warn!(
+                        errors = hw_errs,
+                        starved = hw_starve,
+                        "hardware decode failing, switching to software mid-stream"
+                    );
+                    let d = open_sw(&v_params)?;
+                    let _ = tx.send(PipelineEvent::Info {
+                        codec: video_codec.clone(),
+                        width: d.width(),
+                        height: d.height(),
+                        decoder: "sw(auto-fallback)".into(),
+                    });
+                    vpath = VPath::Sw(d);
+                    fell_back = true;
+                    hw_errs = 0;
+                    hw_starve = 0;
                 }
             } else if idx == a_index {
                 if let (Some(ad), Some(rs)) = (a_decoder.as_mut(), resampler.as_mut()) {
@@ -317,6 +370,78 @@ fn f32_from_le(bytes: &[u8]) -> Vec<f32> {
         .collect()
 }
 
+/// Active video decode path. Starts on hardware (d3d11va) when available and
+/// can degrade to software mid-stream without dropping the connection.
+#[cfg(feature = "ffmpeg")]
+enum VPath {
+    Hw(HwVideoDecoder),
+    Sw(ffmpeg::codec::decoder::video::Video),
+}
+
+#[cfg(feature = "ffmpeg")]
+fn open_sw(
+    params: &ffmpeg::codec::Parameters,
+) -> anyhow::Result<ffmpeg::codec::decoder::video::Video> {
+    Ok(
+        ffmpeg::codec::context::Context::from_parameters(params.clone())?
+            .decoder()
+            .video()?,
+    )
+}
+
+/// "Call again later" errors (AVERROR(EAGAIN) surfaces as Other{errno}; EOF
+/// is the normal end of a flush) — not decode failures.
+#[cfg(feature = "ffmpeg")]
+fn is_transient(e: &ffmpeg::Error) -> bool {
+    matches!(e, ffmpeg::Error::Other { .. } | ffmpeg::Error::Eof)
+}
+
+/// Software path: convert a decoded frame to BGRA and ship it. The scaler is
+/// (re)created from the frame itself, so formats unknown at open time and
+/// mid-stream resolution changes just work.
+#[cfg(feature = "ffmpeg")]
+fn emit_cpu(
+    scaler: &mut Option<ffmpeg::software::scaling::Context>,
+    scaler_warned: &mut bool,
+    frame: &ffmpeg::util::frame::video::Video,
+    bgra: &mut ffmpeg::util::frame::video::Video,
+    tx: &mpsc::UnboundedSender<PipelineEvent>,
+) {
+    let mut run = |scaler: &mut Option<ffmpeg::software::scaling::Context>| {
+        scaler
+            .as_mut()
+            .map(|sc| sc.run(frame, bgra).is_ok())
+            .unwrap_or(false)
+    };
+    let mut ok = run(scaler);
+    if !ok {
+        // First frame, or format/dimensions changed (InputChanged):
+        // (re)build the scaler from the frame itself.
+        *scaler = ffmpeg::software::scaling::Context::get(
+            frame.format(),
+            frame.width(),
+            frame.height(),
+            ffmpeg::format::Pixel::BGRA,
+            frame.width(),
+            frame.height(),
+            ffmpeg::software::scaling::flag::Flags::BILINEAR,
+        )
+        .ok();
+        ok = run(scaler);
+    }
+    if ok {
+        let _ = tx.send(PipelineEvent::Video(VideoFrame::Cpu(CpuFrame {
+            width: bgra.width(),
+            height: bgra.height(),
+            stride: bgra.stride(0),
+            data: Arc::new(bgra.data(0).to_vec()),
+        })));
+    } else if !*scaler_warned {
+        *scaler_warned = true;
+        warn!("BGRA conversion unavailable; dropping frames");
+    }
+}
+
 // ---------------------------------------------------------------------------
 
 /// D3D11VA hardware video decoder attached to the shared render device.
@@ -334,26 +459,47 @@ impl HwVideoDecoder {
     /// Configures the raw AVCodecContext for D3D11VA *before* opening.
     fn attach(params: ffmpeg::codec::Parameters, device: gpu::GpuContext) -> anyhow::Result<Self> {
         use ffmpeg::ffi;
-        use std::ptr;
+        use windows::core::Interface;
+        use windows::Win32::Graphics::Direct3D11::ID3D11Device;
 
         let mut context = ffmpeg::codec::context::Context::from_parameters(params)?;
         unsafe {
-            let mut hw_ctx: *mut ffi::AVBufferRef = ptr::null_mut();
-            let code = ffi::av_hwdevice_ctx_create(
-                &mut hw_ctx,
-                ffi::AVHWDeviceType::AV_HWDEVICE_TYPE_D3D11VA,
-                ptr::null(),
-                ptr::null_mut(),
-                0,
-            );
-            if code != 0 || hw_ctx.is_null() {
-                anyhow::bail!("av_hwdevice_ctx_create failed ({code})");
+            // Decode on the *render* device: decoded textures then live on
+            // the same D3D11 device as the renderer, whose texture handoff
+            // (CopySubresourceRegion on its own context) is a valid
+            // same-device GPU copy. Letting ffmpeg create its own device
+            // (av_hwdevice_ctx_create with NULL) yields textures the render
+            // context cannot reach → permanently black window.
+            let mut hw_ctx = ffi::av_hwdevice_ctx_alloc(ffi::AVHWDeviceType::AV_HWDEVICE_TYPE_D3D11VA);
+            if hw_ctx.is_null() {
+                anyhow::bail!("av_hwdevice_ctx_alloc failed");
+            }
+            // AVBufferRef.data → AVHWDeviceContext, whose .hwctx is the
+            // d3d11-specific struct (writing through ref.data directly would
+            // smash the header fields → AV inside av_hwdevice_ctx_init).
+            let dev = (*hw_ctx).data as *mut ffi::AVHWDeviceContext;
+            let hwdev = (*dev).hwctx as *mut ffi::AVD3D11VADeviceContext;
+            // Hand ffmpeg one reference to the render device (its device_free
+            // Releases it); into_raw transfers our AddRef.
+            let render_dev: ID3D11Device = device.device().clone();
+            (*hwdev).device = render_dev.into_raw() as *mut ffi::ID3D11Device;
+            let code = ffi::av_hwdevice_ctx_init(hw_ctx);
+            if code != 0 {
+                ffi::av_buffer_unref(&mut hw_ctx);
+                anyhow::bail!("av_hwdevice_ctx_init failed ({code})");
             }
             let cc = context.as_mut_ptr();
             (*cc).hw_device_ctx = ffi::av_buffer_ref(hw_ctx);
+            ffi::av_buffer_unref(&mut hw_ctx);
             (*cc).get_format = Some(hw_get_format);
         }
-        let inner = context.decoder().open()?.video()?;
+        // `Context::from_parameters` leaves ctx->codec NULL, and
+        // `Decoder::open()` then calls avcodec_open2 with no codec → EINVAL
+        // (why d3d11va silently never engaged before). Find the decoder
+        // explicitly and open with it.
+        let codec = ffmpeg::codec::decoder::find(context.id())
+            .ok_or_else(|| anyhow::anyhow!("no decoder for stream"))?;
+        let inner = context.decoder().open_as(codec)?.video()?;
         let (width, height) = (inner.width(), inner.height());
         if width == 0 || height == 0 {
             anyhow::bail!("invalid video dimensions");
@@ -367,12 +513,21 @@ impl HwVideoDecoder {
         })
     }
 
-    fn send(&mut self, packet: &ffmpeg::codec::packet::Packet) -> bool {
-        self.inner.send_packet(packet).is_ok()
+    fn send(&mut self, packet: &ffmpeg::codec::packet::Packet) -> Result<(), ffmpeg::Error> {
+        self.inner.send_packet(packet)
     }
 
-    fn receive(&mut self, frame: &mut ffmpeg::util::frame::video::Video) -> bool {
-        self.inner.receive_frame(frame).is_ok()
+    /// Ok(true) = frame decoded, Ok(false) = nothing more (EAGAIN),
+    /// Err = hard decode error.
+    fn receive(
+        &mut self,
+        frame: &mut ffmpeg::util::frame::video::Video,
+    ) -> Result<bool, ffmpeg::Error> {
+        match self.inner.receive_frame(frame) {
+            Ok(()) => Ok(true),
+            Err(e) if is_transient(&e) => Ok(false),
+            Err(e) => Err(e),
+        }
     }
 
     /// Wraps the decoder's D3D11 texture (texture array + subresource) so the
@@ -381,6 +536,11 @@ impl HwVideoDecoder {
         unsafe {
             let av = frame.as_ptr();
             if (*av).format != ffmpeg::ffi::AVPixelFormat::AV_PIX_FMT_D3D11 as std::ffi::c_int {
+                use std::sync::atomic::{AtomicBool, Ordering};
+                static WARNED: AtomicBool = AtomicBool::new(false);
+                if !WARNED.swap(true, Ordering::Relaxed) {
+                    warn!(format = (*av).format, "decoded frame is not D3D11; gpu path skipped");
+                }
                 return None;
             }
             let raw = (*av).data[0] as *mut windows::Win32::Graphics::Direct3D11::ID3D11Texture2D;
@@ -420,4 +580,32 @@ unsafe extern "C" fn hw_get_format(
         p = p.add(1);
     }
     *fmts
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Reproduces the hw-decode attach FFI sequence against the real render
+    /// device: create device (VIDEO_SUPPORT), hand it to FFmpeg, init.
+    #[test]
+    fn hw_device_init_on_render_device() {
+        let gpu = gpu::GpuContext::create().expect("render device");
+        unsafe {
+            let mut hw_ctx =
+                ffmpeg::ffi::av_hwdevice_ctx_alloc(ffmpeg::ffi::AVHWDeviceType::AV_HWDEVICE_TYPE_D3D11VA);
+            assert!(!hw_ctx.is_null());
+            let dev = (*hw_ctx).data as *mut ffmpeg::ffi::AVHWDeviceContext;
+            let hwdev = (*dev).hwctx as *mut ffmpeg::ffi::AVD3D11VADeviceContext;
+            use windows::core::Interface;
+            use windows::Win32::Graphics::Direct3D11::ID3D11Device;
+            let render_dev: ID3D11Device = gpu.device().clone();
+            (*hwdev).device = render_dev.into_raw() as *mut ffmpeg::ffi::ID3D11Device;
+            eprintln!("[test] device set, init…");
+            let code = ffmpeg::ffi::av_hwdevice_ctx_init(hw_ctx);
+            eprintln!("[test] init code={code}");
+            ffmpeg::ffi::av_buffer_unref(&mut hw_ctx);
+            assert_eq!(code, 0, "av_hwdevice_ctx_init failed");
+        }
+    }
 }

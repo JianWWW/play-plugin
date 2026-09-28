@@ -34,7 +34,7 @@ RustRover / Visual Studio 2022 同理：VS 用「调试 → 附加到进程」�
 
 - FFmpeg 是外部 DLL（gyan.dev 构建无符号），**调不进去**，靠日志：
   `RUST_LOG=play_core=debug`，关注 `d3d11va unavailable` / `stream error` 行。
-- 硬解是否生效看 `stream.info` 事件的 `decoder` 字段（`d3d11va` / `sw`）。
+- 硬解是否生效看 `stream.info` 事件的 `decoder` 字段（`d3d11va` / `sw`；运行期硬解连续报错或只进包不出帧时自动切软解，值变为 `sw(auto-fallback)`，不重新拉流）。
 - 快速复现某路流：`PLAY_PLUGIN_TEST_URL=<url> cargo test -p plugin-server
   --test real_stream -- --ignored --nocapture`（见 README）。
 
