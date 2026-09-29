@@ -1,6 +1,6 @@
 {
   "name": "playplugin-sdk",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "PlayPlugin TypeScript SDK for the PlayPlugin native overlay player (RTSP/FLV/HLS, H.264/H.265) for web pages.",
   "type": "module",
   "main": "./dist/index.js",
