@@ -12,7 +12,7 @@ use crate::{
     gpu, AudioChunk, CpuFrame, PipelineEvent, PipelineHandle, StreamOptions, StreamState,
     VideoFrame,
 };
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, Once};
 use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
@@ -48,9 +48,14 @@ pub fn spawn(
 
     let close = Arc::new(AtomicBool::new(false));
     let muted = Arc::new(AtomicBool::new(opts.muted));
+    let paused = Arc::new(AtomicBool::new(false));
+    let speed_permille = Arc::new(AtomicU32::new(1000));
+    let (cmd_tx, cmd_rx) = std::sync::mpsc::channel::<crate::PipelineCmd>();
     let close2 = close.clone();
     let muted2 = muted.clone();
+    let paused2 = paused.clone();
     let raw_url = opts.url.clone();
+    let title = opts.title.clone();
     let label = crate::redact_url(&raw_url)
         .chars()
         .take(32)
@@ -58,22 +63,32 @@ pub fn spawn(
     let _ = std::thread::Builder::new()
         .name(format!("pl-{label}"))
         .spawn(move || {
-            run_loop(close2, muted2, &raw_url, device, tx);
+            run_loop(close2, muted2, paused2, cmd_rx, &raw_url, &title, device, tx);
         });
-    PipelineHandle { close, muted }
+    PipelineHandle {
+        close,
+        muted,
+        paused,
+        speed_permille,
+        cmd_tx,
+        speed_supported: false,
+    }
 }
 
 fn run_loop(
     close: Arc<AtomicBool>,
     muted: Arc<AtomicBool>,
+    paused: Arc<AtomicBool>,
+    cmd_rx: std::sync::mpsc::Receiver<crate::PipelineCmd>,
     url: &str,
+    title: &str,
     device: Option<gpu::GpuContext>,
     tx: mpsc::UnboundedSender<PipelineEvent>,
 ) {
     let mut consecutive_failures: usize = 0;
     while !close.load(Ordering::Relaxed) {
         let started = Instant::now();
-        match run_once(&close, &muted, url, device.clone(), &tx) {
+        match run_once(&close, &muted, &paused, &cmd_rx, url, title, device.clone(), &tx) {
             Ok(()) => {
                 let _ = tx.send(PipelineEvent::State {
                     state: StreamState::Stopped,
@@ -86,7 +101,7 @@ fn run_loop(
                 if close.load(Ordering::Relaxed) {
                     return;
                 }
-                warn!(url = %url, error = %e, "stream error, reconnecting");
+                warn!(url = %crate::redact_url(url), error = %e, "stream error, reconnecting");
                 let _ = tx.send(PipelineEvent::State {
                     state: StreamState::Reconnecting,
                     code: Some("STREAM_ERROR"),
@@ -110,7 +125,10 @@ fn run_loop(
 fn run_once(
     close: &AtomicBool,
     muted: &AtomicBool,
+    paused: &AtomicBool,
+    cmd_rx: &std::sync::mpsc::Receiver<crate::PipelineCmd>,
     url: &str,
+    title: &str,
     device: Option<gpu::GpuContext>,
     tx: &mpsc::UnboundedSender<PipelineEvent>,
 ) -> anyhow::Result<()> {
@@ -145,7 +163,9 @@ fn run_once(
         .as_ref()
         .map(|s| s.index())
         .unwrap_or(usize::MAX);
+    let a_tb = audio_stream.as_ref().map(|s| s.time_base());
     let audio_params = audio_stream.map(|s| s.parameters());
+    let v_tb = video_stream.time_base();
 
     // --- video decoder: hardware first, auto-fallback to software ---------
     // Stream parameters are kept around: a mid-stream hw→sw switch rebuilds
@@ -195,7 +215,8 @@ fn run_once(
 
     // --- audio decoder → f32 / 48kHz / stereo (optional) -------------------
     let mut a_decoder = audio_params
-        .and_then(|p| ffmpeg::codec::context::Context::from_parameters(p).ok())
+        .as_ref()
+        .and_then(|p| ffmpeg::codec::context::Context::from_parameters(p.clone()).ok())
         .and_then(|c| c.decoder().audio().ok());
     let mut resampler = a_decoder.as_ref().and_then(|ad| {
         ffmpeg::software::resampling::Context::get(
@@ -220,16 +241,79 @@ fn run_once(
     let mut bytes_window: u64 = 0;
     let mut stat_t = Instant::now();
     let mut last_packet = Instant::now();
+    // Audio gate for recording: MP4 carries aac, not G.711.
+    let a_is_aac = audio_params
+        .as_ref()
+        .and_then(|p| ffmpeg::codec::context::Context::from_parameters(p.clone()).ok())
+        .map(|c| c.id() == ffmpeg::codec::Id::AAC)
+        .unwrap_or(false);
+    let mut recorder: Option<RecordWriter> = None;
 
     let result = (|| -> anyhow::Result<()> {
-        for (stream, packet) in ictx.packets() {
+        // Manual read loop (not `ictx.packets()`): the demuxer must stay
+        // seekable (`&mut ictx`) while commands arrive mid-stream.
+        let mut packet = ffmpeg::Packet::empty();
+        loop {
             if close.load(Ordering::Relaxed) {
                 return Ok(());
             }
+            // Commands (seek / record) run on this thread: it owns the
+            // demuxer. av_read_frame blocks between packets, so replies lag
+            // up to one packet interval on silent streams.
+            while let Ok(cmd) = cmd_rx.try_recv() {
+                match cmd {
+                    crate::PipelineCmd::Seek { time_ms, reply } => {
+                        // avformat_seek_file(µs, stream=-1). Live RTSP/HLS
+                        // demuxers have no read_seek → honest error.
+                        let r = ictx
+                            .seek(time_ms.saturating_mul(1000), ..)
+                            .map_err(|e| e.to_string());
+                        let _ = reply.send(r);
+                    }
+                    crate::PipelineCmd::RecordStart { reply } => {
+                        let a_out = if a_is_aac && a_index != usize::MAX {
+                            audio_params.as_ref().zip(a_tb).map(|(p, t)| (p, t, a_index))
+                        } else {
+                            None
+                        };
+                        let r = match recorder {
+                            Some(_) => Err("already recording".into()),
+                            None => RecordWriter::start(
+                                &v_params,
+                                v_tb,
+                                v_index,
+                                a_out,
+                                title,
+                            )
+                            .map(|w| {
+                                let p = w.path.clone();
+                                recorder = Some(w);
+                                p
+                            }),
+                        };
+                        let _ = reply.send(r);
+                    }
+                    crate::PipelineCmd::RecordStop { reply } => {
+                        let r = match recorder.take() {
+                            Some(w) => w.finish(),
+                            None => Err("not recording".into()),
+                        };
+                        let _ = reply.send(r);
+                    }
+                }
+            }
+            match packet.read(&mut ictx) {
+                Ok(()) => {}
+                Err(ffmpeg::Error::Eof) => break,
+                Err(e) => return Err(anyhow::anyhow!("read: {e}")),
+            }
             last_packet = Instant::now();
             bytes_window += packet.size() as u64;
-            let idx = stream.index();
-            if idx == v_index {
+            let idx = packet.stream();
+            // Display freeze: decode nothing (audio included), keep draining
+            // so network buffers never build up and the watchdog stays happy.
+            let frozen = paused.load(Ordering::Relaxed);
+            if idx == v_index && !frozen {
                 let mut fallback = false;
                 match &mut vpath {
                     VPath::Hw(h) => {
@@ -313,7 +397,7 @@ fn run_once(
                     hw_errs = 0;
                     hw_starve = 0;
                 }
-            } else if idx == a_index {
+            } else if idx == a_index && !frozen {
                 if let (Some(ad), Some(rs)) = (a_decoder.as_mut(), resampler.as_mut()) {
                     if ad.send_packet(&packet).is_ok() {
                         while ad.receive_frame(&mut a_frame).is_ok() {
@@ -330,6 +414,16 @@ fn run_once(
                                 }
                             }
                         }
+                    }
+                }
+            }
+            // Recording remuxes at demux level — runs even while the display
+            // is frozen (pause ≠ stop recording).
+            if let Some(w) = recorder.as_mut() {
+                if w.write(idx, &mut packet).is_err() {
+                    warn!("recording write failed, finalizing");
+                    if let Some(dead) = recorder.take() {
+                        let _ = dead.finish();
                     }
                 }
             }
@@ -368,6 +462,93 @@ fn f32_from_le(bytes: &[u8]) -> Vec<f32> {
         .chunks_exact(4)
         .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
         .collect()
+}
+
+/// Codec-copy recorder: remuxes demuxed packets into a fragmented MP4
+/// (frag_keyframe + empty_moov) — the file stays playable if the process
+/// dies mid-recording. Audio is muxed only when it is AAC (MP4 does not
+/// carry G.711).
+struct RecordWriter {
+    octx: ffmpeg::format::context::Output,
+    path: std::path::PathBuf,
+    /// (input stream index, output stream index, input time_base)
+    maps: Vec<(usize, usize, ffmpeg::Rational)>,
+}
+
+impl RecordWriter {
+    fn start(
+        v_params: &ffmpeg::codec::Parameters,
+        v_tb: ffmpeg::Rational,
+        v_index: usize,
+        a: Option<(&ffmpeg::codec::Parameters, ffmpeg::Rational, usize)>,
+        title: &str,
+    ) -> Result<Self, String> {
+        let dir = crate::default_record_dir();
+        std::fs::create_dir_all(&dir).map_err(|e| format!("mkdir {}: {e}", dir.display()))?;
+        let safe: String = title
+            .chars()
+            .filter(|c| !c.is_control() && !r#"\/:*?"<>|"#.contains(*c))
+            .take(48)
+            .collect::<String>();
+        let ts = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        let path = dir
+            .join(format!("{}-{ts}.mp4", if safe.is_empty() { "stream" } else { &safe }));
+
+        let mut octx = ffmpeg::format::output(&path).map_err(|e| e.to_string())?;
+        let mut maps = Vec::with_capacity(2);
+        for (params, tb, in_idx) in std::iter::once((v_params, v_tb, v_index)).chain(
+            a.map(|(p, t, i)| (p, t, i)),
+        ) {
+            let cctx = ffmpeg::codec::context::Context::from_parameters(params.clone())
+                .map_err(|e| e.to_string())?;
+            let out_idx = maps.len();
+            let mut os = octx.add_stream_with(&cctx).map_err(|e| e.to_string())?;
+            os.set_parameters(params.clone());
+            os.set_time_base(tb);
+            maps.push((in_idx, out_idx, tb));
+        }
+        // fMP4 so an interrupted recording is still playable.
+        unsafe {
+            let p = octx.as_mut_ptr();
+            if !(*p).priv_data.is_null() {
+                ffmpeg::ffi::av_opt_set(
+                    (*p).priv_data,
+                    b"movflags\0".as_ptr() as *const _,
+                    b"+frag_keyframe+empty_moov\0".as_ptr() as *const _,
+                    0,
+                );
+            }
+        }
+        octx.write_header().map_err(|e| e.to_string())?;
+        Ok(Self { octx, path, maps })
+    }
+
+    /// `av_interleaved_write_frame` consumes the packet — call after decode.
+    fn write(&mut self, in_idx: usize, packet: &mut ffmpeg::Packet) -> Result<(), String> {
+        let Some(&(_, out_idx, in_tb)) = self.maps.iter().find(|(i, _, _)| *i == in_idx) else {
+            return Ok(()); // stream not muxed (e.g. G.711 audio)
+        };
+        let out_tb = self
+            .octx
+            .stream(out_idx)
+            .map(|s| s.time_base())
+            .ok_or("output stream gone")?;
+        packet.rescale_ts(in_tb, out_tb);
+        packet.set_stream(out_idx);
+        packet
+            .write_interleaved(&mut self.octx)
+            .map_err(|e| e.to_string())
+    }
+
+    fn finish(mut self) -> Result<std::path::PathBuf, String> {
+        self.octx
+            .write_trailer()
+            .map_err(|e| e.to_string())?;
+        Ok(self.path)
+    }
 }
 
 /// Active video decode path. Starts on hardware (d3d11va) when available and
@@ -607,5 +788,22 @@ mod tests {
             ffmpeg::ffi::av_buffer_unref(&mut hw_ctx);
             assert_eq!(code, 0, "av_hwdevice_ctx_init failed");
         }
+    }
+}
+
+/// Guards the FFmpeg build contract: recording needs the mp4 muxer in the
+/// DLLs. Fails with "Unknown format" when FFmpeg was rebuilt without
+/// `--enable-muxer=mp4` (configure-ffmpeg-min.sh).
+#[cfg(all(test, feature = "ffmpeg"))]
+mod muxer_tests {
+    #[test]
+    fn mp4_muxer_available_in_dll() {
+        use ffmpeg_next as ffmpeg;
+        let dir = std::env::temp_dir().join("pp-mp4-probe");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("probe.mp4");
+        let r = ffmpeg::format::output(&path);
+        let _ = std::fs::remove_file(&path);
+        assert!(r.is_ok(), "mp4 muxer missing — rebuild FFmpeg with --enable-muxer=mp4");
     }
 }

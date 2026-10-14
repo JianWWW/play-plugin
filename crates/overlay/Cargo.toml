@@ -29,3 +29,4 @@ windows = { workspace = true, features = [
 
 [dev-dependencies]
 tracing-subscriber = { workspace = true }
+tokio = { workspace = true }

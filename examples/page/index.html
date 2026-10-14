@@ -6,8 +6,9 @@
 <style>
   body { font-family: system-ui, sans-serif; background: #111; color: #eee; margin: 2rem; }
   .grid { display: grid; grid-template-columns: repeat(4, 1fr); gap: 12px; }
-  .cam { aspect-ratio: 16/9; background: #222; border: 1px dashed #555; position: relative; }
-  .cam .tag { position: absolute; left: 6px; top: 6px; font-size: 12px; color: #9cf; z-index: 3; }
+  .cam { aspect-ratio: 16/9; background: #222; border: 1px dashed #555; position: relative; cursor: pointer; }
+  .cam.sel { border: 2px solid #4af; box-shadow: 0 0 8px #4af inset; }
+  .cam .tag { position: absolute; left: 6px; top: 6px; font-size: 12px; color: #9cf; z-index: 3; pointer-events: none; }
   .cam .ctrl { position: absolute; right: 6px; bottom: 6px; z-index: 3; }
   #banner { background: #7a2020; padding: 12px; border-radius: 8px; margin-bottom: 1rem; display: none; }
   #banner a { color: #fff; }
@@ -22,10 +23,11 @@
 <h2>PlayPlugin Overlay 手动测试</h2>
 <p>
   <input id="url" value="rtsp://admin:password@192.168.1.64:554/Streaming/Channels/101">
-  <button id="open1">打开 1 路</button>
-  <button id="open4">打开 4 路</button>
+  <button id="openSel">在选中宫格播放</button>
+  <button id="closeSel">关闭选中</button>
   <button id="closeAll">全部关闭</button>
   <button id="conceal">隐藏浮层 2 秒</button>
+  <span style="color:#888">（单击选中宫格，双击直接播放）</span>
 </p>
 <div class="grid" id="grid"></div>
 <pre id="log" style="color:#9f9"></pre>
@@ -35,9 +37,8 @@
   //   cd sdk && npx tsc && 在页面 import "./sdk/dist/index.js"
   import { detectPlugin, OverlayPlayer, downloadUrl } from "../../sdk/dist/index.js";
 
+  const N = 16; // 默认 4x4 = 16 宫格
   const log = (m) => { document.getElementById("log").textContent += m + "\n"; };
-  const players = [];
-  const grid = document.getElementById("grid");
   document.getElementById("dl").href = downloadUrl;
 
   const info = await detectPlugin();
@@ -47,40 +48,60 @@
     log(`插件已安装: v${info.version}, protocol=${info.protocol}`);
   }
 
-  function makeCam(i) {
+  // 单选：同一时刻只有一个选中格
+  let sel = null; // cells[i] = { el, player: OverlayPlayer | null }
+  const cells = [];
+  const grid = document.getElementById("grid");
+  for (let i = 0; i < N; i++) {
     const div = document.createElement("div");
     div.className = "cam";
     div.innerHTML = `<span class="tag">cam-${i}</span><span class="ctrl"><button>抓图</button></span>`;
     grid.appendChild(div);
-    return div;
+    const cell = { el: div, player: null };
+    div.onclick = () => select(cell);
+    div.ondblclick = () => playCell(cell);
+    div.querySelector("button").onclick = async (e) => {
+      e.stopPropagation();
+      if (cell.player) log("snapshot: " + await cell.player.snapshot());
+    };
+    cells.push(cell);
+  }
+  function select(cell) {
+    if (sel) sel.el.classList.remove("sel");
+    sel = cell;
+    cell.el.classList.add("sel");
+  }
+  select(cells[0]);
+
+  function tagOf(i) { return cells[i].el.querySelector(".tag"); }
+  function bindEvents(cell, i) {
+    cell.player.on("state", (s) => log(`cam-${i} state=${s.state} ${s.message ?? ""}`));
+    cell.player.on("info", (s) => log(`cam-${i} ${s.width}x${s.height} ${s.codec} [${s.decoder}]`));
+    cell.player.on("stats", (s) => { tagOf(i).textContent = `cam-${i} ${s.fps.toFixed(1)}fps ${s.decoder}`; });
   }
 
-  async function open(n) {
-    await closeAll();
+  async function closeCell(cell) {
+    if (cell.player) { await cell.player.close(); cell.player = null; }
+    tagOf(cells.indexOf(cell)).textContent = `cam-${cells.indexOf(cell)}`;
+  }
+
+  async function playCell(cell) {
+    const i = cells.indexOf(cell);
+    await closeCell(cell);
     const url = document.getElementById("url").value;
-    for (let i = 0; i < n; i++) {
-      const cam = makeCam(i);
-      const p = new OverlayPlayer({ url, mount: cam, muted: true });
-      p.on("state", (s) => log(`cam-${i} state=${s.state} ${s.message ?? ""}`));
-      p.on("info", (s) => log(`cam-${i} ${s.width}x${s.height} ${s.codec} [${s.decoder}]`));
-      p.on("stats", (s) => { cam.querySelector(".tag").textContent = `cam-${i} ${s.fps.toFixed(1)}fps ${s.decoder}`; });
-      cam.querySelector("button").onclick = async () => log("snapshot: " + await p.snapshot());
-      players.push(p);
-      await p.open();
-    }
+    cell.player = new OverlayPlayer({ url, mount: cell.el, muted: true });
+    bindEvents(cell, i);
+    await cell.player.open();
   }
 
-  async function closeAll() {
-    for (const p of players.splice(0)) await p.close();
-    grid.innerHTML = "";
-  }
+  async function closeAll() { for (const c of cells) await closeCell(c); }
 
-  document.getElementById("open1").onclick = () => open(1);
-  document.getElementById("open4").onclick = () => open(4);
+  document.getElementById("openSel").onclick = () => playCell(sel);
+  document.getElementById("closeSel").onclick = () => closeCell(sel);
   document.getElementById("closeAll").onclick = closeAll;
   document.getElementById("conceal").onclick = () => {
-    for (const p of players) p.conceal();
-    setTimeout(() => { for (const p of players) p.reveal(); }, 2000);
+    for (const c of cells) if (c.player) c.player.conceal();
+    setTimeout(() => { for (const c of cells) if (c.player) c.player.reveal(); }, 2000);
   };
 </script>
 </body>

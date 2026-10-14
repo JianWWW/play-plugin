@@ -16,6 +16,7 @@ export interface Rect {
 export type StreamState =
   | "connecting"
   | "playing"
+  | "paused"
   | "reconnecting"
   | "stopped"
   | "error";
@@ -37,6 +38,8 @@ export interface HelloResult {
     rtsp: boolean;
     flv: boolean;
     hls: boolean;
+    rtmp: boolean;
+    udp: boolean;
     hardwareDecode: boolean;
   };
 }
@@ -107,5 +110,5 @@ export function parseFrame(text: string): Response | ServerEvent | null {
 }
 
 export function isSupportedUrl(url: string): boolean {
-  return /^(rtsp|rtsps|https?|test):\/\//i.test(url);
+  return /^(rtsp|rtsps|https?|rtmps?|udp|test):\/\//i.test(url);
 }

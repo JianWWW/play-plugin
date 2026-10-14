@@ -49,6 +49,9 @@ describe("protocol", () => {
     expect(isSupportedUrl("http://cdn/live.flv")).toBe(true);
     expect(isSupportedUrl("https://cdn/live.m3u8")).toBe(true);
     expect(isSupportedUrl("test://pattern")).toBe(true);
+    expect(isSupportedUrl("rtmp://host/live")).toBe(true);
+    expect(isSupportedUrl("rtmps://host/live")).toBe(true);
+    expect(isSupportedUrl("udp://@239.1.1.1:5000")).toBe(true);
     expect(isSupportedUrl("file:///c:/video.mp4")).toBe(false);
     expect(isSupportedUrl("javascript:alert(1)")).toBe(false);
     expect(isSupportedUrl("")).toBe(false);

@@ -3,9 +3,11 @@ PlayPlugin — third-party notices
 
 This application uses FFmpeg (https://ffmpeg.org) under the GNU Lesser General
 Public License v2.1 or later, dynamically linked. The FFmpeg DLLs shipped with
-this installer (avcodec-63.dll, avformat-63.dll, avutil-61.dll, swresample-7.dll,
-swscale-10.dll, avdevice-63.dll, avfilter-12.dll) can be replaced to exercise the
-"install a newer/modified FFmpeg" freedom granted by the LGPL.
+this installer (avcodec-63.dll, avformat-63.dll, avutil-61.dll,
+swresample-7.dll, swscale-10.dll) are a minimal decode-only build
+(FFmpeg 9.0.2; see installer/configure-ffmpeg-min.sh for the exact
+configuration) and can be replaced to exercise the "install a newer/modified
+FFmpeg" freedom granted by the LGPL.
 
 FFmpeg source code: https://ffmpeg.org/download.html
 FFmpeg license: https://www.ffmpeg.org/legal.html (LGPL-2.1-or-later)

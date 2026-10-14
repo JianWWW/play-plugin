@@ -72,3 +72,20 @@ PLAY_PLUGIN_UI_TRACE=1 cargo run -p plugin-app -- --smoke
 | 窗口不出现 | 日志搜 `overlay window created`；没有 → 渲染器失败行；有 → 看 `stream.rect` 是否推送（页面侧） |
 | 画面黑/花屏 | `--smoke` 隔离（自带帧内容断言）；软解/硬解切换看 `decoder` 字段 |
 | 静默安装后白名单没生效 | 确认 msiexec 命令带了 `ORIGINS="..."`，看 `%APPDATA%\PlayPlugin\config.toml` 时间戳 |
+
+## 4. 网页端调试（SDK debug 开关）
+
+页面侧一行开启，端到端生效（SDK console 日志 + 原生文件日志同时进 debug 级）：
+
+```ts
+import { configure } from "playplugin-sdk";
+configure({ debug: true });   // 须在创建首个播放器之前调用
+```
+
+- SDK 日志打到浏览器 console，前缀 `[playplugin][conn|protocol|player|rect]`；
+  可见性翻转必打，rect 位置打"停稳后"的一行（150ms 防抖），`stream.stats` 与
+  `stream.rect` 请求不记（每秒/每帧刷屏）。
+- 原生侧通过 `hello {debug:true}` 提升进程日志级别到 debug：**进程级、只升不降**，
+  进程重启后恢复 `config.toml`/`RUST_LOG` 的设定（取舍见 `docs/adr/0001`）。
+  旧版插件不认识该字段，静默降级为仅 SDK 日志。
+- 日志中的流 URL 凭据（`user:pass@`）在 SDK 与原生两侧的日志出口统一脱敏为 `***@`。

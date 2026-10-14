@@ -1,6 +1,9 @@
 # Downloads an FFmpeg full-shared build (headers + MSVC import libs + DLLs)
-# into .deps\ffmpeg — needed for `cargo build` (ffmpeg-sys-next) and for
-# bundling DLLs into the MSI. Run from repo root:  powershell -File installer\fetch-ffmpeg.ps1
+# into .deps\ffmpeg — FALLBACK for `cargo build` (ffmpeg-sys-next) on machines
+# without MSYS2. The shipped MSI always uses the minimal build from
+# installer\build-ffmpeg-min.cmd (~13MB vs ~230MB). If you use this fallback,
+# point FFMPEG_DIR in .cargo/config.toml at the extracted directory.
+# Run from repo root:  powershell -File installer\fetch-ffmpeg.ps1
 
 $ErrorActionPreference = "Stop"
 New-Item -ItemType Directory -Force -Path .deps | Out-Null

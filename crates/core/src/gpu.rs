@@ -60,6 +60,7 @@ impl GpuContext {
                 Some(&mut context),
             )
         };
+        // No GPU present fallback flag lives inline below.
         if hr.is_err() {
             // No GPU present (CI VM): fall back to WARP software rasterizer.
             hr = unsafe {

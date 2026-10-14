@@ -72,6 +72,39 @@ impl AppState {
             .retain(|_, tx| tx.send(Message::Text(text.clone())).is_ok());
     }
 
+    /// Single click on an overlay: notify the owning page so it can mark the
+    /// stream as selected.
+    pub fn notify_select(&self, stream_id: u64) {
+        let event = Event::new(
+            "stream.select",
+            serde_json::json!({ "streamId": stream_id }),
+        );
+        let text = serde_json::to_string(&event).unwrap_or_default();
+        let inner = self.inner.lock().unwrap();
+        if let Some(e) = inner.streams.get(&stream_id) {
+            if let Some(tx) = inner.conns.get(&e.conn_id) {
+                let _ = tx.send(Message::Text(text));
+            }
+        }
+    }
+
+    /// Native control-bar button press: routed to the owning page as
+    /// `app.control` (the SDK applies defaults or hands it to `onControl`).
+    pub fn notify_control(&self, stream_id: u64, button: String, value: Option<f64>) {
+        let event = Event::control(crate::protocol::ControlEvent {
+            stream_id,
+            button,
+            value,
+        });
+        let text = serde_json::to_string(&event).unwrap_or_default();
+        let inner = self.inner.lock().unwrap();
+        if let Some(e) = inner.streams.get(&stream_id) {
+            if let Some(tx) = inner.conns.get(&e.conn_id) {
+                let _ = tx.send(Message::Text(text));
+            }
+        }
+    }
+
     fn register_conn(&self, tx: mpsc::UnboundedSender<Message>) -> u64 {
         let mut inner = self.inner.lock().unwrap();
         let id = inner.next_conn_id;
@@ -81,14 +114,6 @@ impl AppState {
     }
 
     fn remove_conn(&self, conn_id: u64) {
-        let closed = self
-            .inner
-            .lock()
-            .unwrap()
-            .streams
-            .keys()
-            .copied()
-            .collect::<Vec<_>>();
         let mut inner = self.inner.lock().unwrap();
         inner.conns.remove(&conn_id);
         let mine: Vec<u64> = inner
@@ -97,7 +122,6 @@ impl AppState {
             .filter(|(_, e)| e.conn_id == conn_id)
             .map(|(id, _)| *id)
             .collect();
-        let _ = closed;
         for id in mine {
             if let Some(e) = inner.streams.remove(&id) {
                 e.handle
@@ -141,6 +165,28 @@ pub async fn serve(config: Config, state: Arc<AppState>) -> anyhow::Result<u16> 
     tokio::spawn(async move {
         if let Err(e) = axum::serve(listener, app).await {
             tracing::error!(error = %e, "http server stopped");
+        }
+    });
+
+    // Overlay UI events: single-click select and control-bar button presses.
+    // Fullscreen toggling is handled entirely inside the overlay host.
+    let ui_state = state.clone();
+    tokio::spawn(async move {
+        loop {
+            match ui_state.host.try_recv_event() {
+                Some(plugin_overlay::host::OverlayUiEvent::Select { stream_id }) => {
+                    ui_state.notify_select(stream_id);
+                }
+                Some(plugin_overlay::host::OverlayUiEvent::Control {
+                    stream_id,
+                    button,
+                    value,
+                }) => {
+                    ui_state.notify_control(stream_id, button.to_string(), value);
+                }
+                None => {}
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
         }
     });
     info!(port, "listening on ws://127.0.0.1:{port}/ws");
@@ -349,6 +395,11 @@ fn handle_text(
     let id = req.id;
 
     if req.method == "hello" {
+        // Page-requested debug: raise the process log level (raise-only, ADR-0001).
+        if req.params.get("debug").and_then(|v| v.as_bool()).unwrap_or(false) {
+            info!(conn_id, "client requested debug logging, raising log level");
+            crate::logging::raise_to("debug");
+        }
         authenticated.store(true, std::sync::atomic::Ordering::Relaxed);
         let _ = tx.send(Message::Text(ok_response(
             id,
@@ -364,6 +415,8 @@ fn handle_text(
                         rtsp: true,
                         flv: true,
                         hls: true,
+                        rtmp: true,
+                        udp: true,
                         hardware_decode: state.config.hardware_decode,
                     },
                 }),
@@ -429,6 +482,30 @@ fn dispatch(state: &Arc<AppState>, conn_id: u64, req: &Request) -> String {
             Ok(p) => snapshot_stream(state, req.id, p.stream_id),
             Err(e) => err_response(req.id, ProtocolError::new("BAD_PARAMS", e.to_string())),
         },
+        "stream.pause" => match serde_json::from_value::<PauseParams>(req.params.clone()) {
+            Ok(p) => pause_stream(state, req.id, p),
+            Err(e) => err_response(req.id, ProtocolError::new("BAD_PARAMS", e.to_string())),
+        },
+        "stream.seek" => match serde_json::from_value::<SeekParams>(req.params.clone()) {
+            Ok(p) if p.time_ms >= 0 => seek_stream(state, req.id, p),
+            Ok(_) => err_response(
+                req.id,
+                ProtocolError::new("BAD_PARAMS", "timeMs must be >= 0"),
+            ),
+            Err(e) => err_response(req.id, ProtocolError::new("BAD_PARAMS", e.to_string())),
+        },
+        "stream.setSpeed" => match serde_json::from_value::<SpeedParams>(req.params.clone()) {
+            Ok(p) if p.speed > 0.0 && p.speed <= 64.0 => set_speed(state, req.id, p),
+            Ok(_) => err_response(
+                req.id,
+                ProtocolError::new("BAD_PARAMS", "speed must be in (0, 64]"),
+            ),
+            Err(e) => err_response(req.id, ProtocolError::new("BAD_PARAMS", e.to_string())),
+        },
+        "stream.record.start" => {
+            record_stream(state, req.id, req.params.clone(), true)
+        }
+        "stream.record.stop" => record_stream(state, req.id, req.params.clone(), false),
         "stream.close" => match serde_json::from_value::<SnapshotParams>(req.params.clone()) {
             Ok(p) => {
                 let entry = state.inner.lock().unwrap().streams.remove(&p.stream_id);
@@ -486,9 +563,12 @@ fn open_stream(state: &Arc<AppState>, conn_id: u64, id: u64, p: OpenParams) -> S
             id,
             ProtocolError::new(
                 "BAD_URL",
-                "unsupported scheme (rtsp/rtsps/http/https/test only)",
+                "unsupported scheme (rtsp/rtsps/rtmp/rtmps/http/https/udp/test only)",
             ),
         );
+    }
+    if let Err(e) = validate_controls(p.controls.as_deref().unwrap_or(&[])) {
+        return err_response(id, ProtocolError::new("BAD_PARAMS", e));
     }
     let mut inner = state.inner.lock().unwrap();
     if inner.streams.contains_key(&p.stream_id) {
@@ -510,6 +590,7 @@ fn open_stream(state: &Arc<AppState>, conn_id: u64, id: u64, p: OpenParams) -> S
     let opts = StreamOptions {
         url: p.url.clone(),
         muted: p.muted,
+        title: p.title.clone().unwrap_or_default(),
     };
     let (etx, erx) = mpsc::unbounded_channel::<PipelineEvent>();
     let device = if state.config.hardware_decode {
@@ -520,6 +601,15 @@ fn open_stream(state: &Arc<AppState>, conn_id: u64, id: u64, p: OpenParams) -> S
     let handle = plugin_core::spawn_stream(opts, device, state.config.force_test_source, etx);
 
     let rect = p.rect;
+    let ui = plugin_overlay::host::UiConfig {
+        title: p.title.clone().unwrap_or_default(),
+        buttons: p.controls.clone().unwrap_or_else(plugin_overlay::host::default_buttons),
+        speeds: p
+            .speeds
+            .clone()
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| vec![1.0, 2.0, 4.0, 8.0, 16.0]),
+    };
     state.host.create(
         p.stream_id,
         Rect {
@@ -528,6 +618,7 @@ fn open_stream(state: &Arc<AppState>, conn_id: u64, id: u64, p: OpenParams) -> S
             w: rect.w,
             h: rect.h,
         },
+        ui,
     );
 
     inner.streams.insert(
@@ -626,6 +717,149 @@ fn open_stream(state: &Arc<AppState>, conn_id: u64, id: u64, p: OpenParams) -> S
 
     info!(stream_id = p.stream_id, url = %crate::redact_url(&p.url), "stream open requested");
     ok_response(id, Result_::default())
+}
+
+/// Display freeze: keep draining the stream, skip decode/render. The page
+/// learns via the broadcast `stream.state` (paused/playing).
+fn pause_stream(state: &Arc<AppState>, id: u64, p: PauseParams) -> String {
+    let new_state = {
+        let mut inner = state.inner.lock().unwrap();
+        match inner.streams.get_mut(&p.stream_id) {
+            None => {
+                return err_response(id, ProtocolError::new("NOT_FOUND", "unknown streamId"))
+            }
+            Some(e) => {
+                e.handle.paused.store(p.paused, std::sync::atomic::Ordering::Relaxed);
+                e.state = if p.paused {
+                    plugin_core::StreamState::Paused
+                } else {
+                    plugin_core::StreamState::Playing
+                };
+                e.state
+            }
+        }
+    };
+    state
+        .host
+        .set_ui_state(p.stream_id, Some(p.paused), None);
+    state.broadcast(&Event::stream_state(StreamStateEvent {
+        stream_id: p.stream_id,
+        state: new_state,
+        code: None,
+        message: None,
+    }));
+    ok_response(id, Result_::default())
+}
+
+/// Seek executes on the pipeline thread (it owns the demuxer); the reply
+/// rides a sync channel with a timeout.
+fn seek_stream(state: &Arc<AppState>, id: u64, p: SeekParams) -> String {
+    let cmd = state
+        .inner
+        .lock()
+        .unwrap()
+        .streams
+        .get(&p.stream_id)
+        .map(|e| e.handle.cmd_tx.clone());
+    let Some(cmd) = cmd else {
+        return err_response(id, ProtocolError::new("NOT_FOUND", "unknown streamId"));
+    };
+    let (rtx, rrx) = std::sync::mpsc::sync_channel(1);
+    if cmd
+        .send(plugin_core::PipelineCmd::Seek {
+            time_ms: p.time_ms,
+            reply: rtx,
+        })
+        .is_err()
+    {
+        return err_response(id, ProtocolError::new("STREAM_CLOSED", "pipeline gone"));
+    }
+    match rrx.recv_timeout(Duration::from_secs(2)) {
+        Ok(Ok(())) => ok_response(id, Result_::default()),
+        Ok(Err(msg)) => {
+            err_response(id, ProtocolError::new("UNSUPPORTED_SEEK", msg))
+        }
+        Err(_) => err_response(
+            id,
+            ProtocolError::new("SEEK_TIMEOUT", "pipeline did not answer in 2s"),
+        ),
+    }
+}
+
+fn set_speed(state: &Arc<AppState>, id: u64, p: SpeedParams) -> String {
+    let h = state
+        .inner
+        .lock()
+        .unwrap()
+        .streams
+        .get(&p.stream_id)
+        .map(|e| {
+            (
+                e.handle.speed_permille.clone(),
+                e.handle.speed_supported,
+            )
+        });
+    match h {
+        None => err_response(id, ProtocolError::new("NOT_FOUND", "unknown streamId")),
+        Some((permille, true)) => {
+            permille.store((p.speed * 1000.0) as u32, std::sync::atomic::Ordering::Relaxed);
+            ok_response(id, Result_::default())
+        }
+        Some((_, false)) => err_response(
+            id,
+            ProtocolError::new(
+                "UNSUPPORTED_SPEED",
+                "speed is server-paced for network streams (GB28181: send platform SIP instead)",
+            ),
+        ),
+    }
+}
+
+fn record_stream(state: &Arc<AppState>, id: u64, params: serde_json::Value, start: bool) -> String {
+    let p: RecordParams = match serde_json::from_value(params) {
+        Ok(p) => p,
+        Err(e) => return err_response(id, ProtocolError::new("BAD_PARAMS", e.to_string())),
+    };
+    let cmd = state
+        .inner
+        .lock()
+        .unwrap()
+        .streams
+        .get(&p.stream_id)
+        .map(|e| e.handle.cmd_tx.clone());
+    let Some(cmd) = cmd else {
+        return err_response(id, ProtocolError::new("NOT_FOUND", "unknown streamId"));
+    };
+    let (rtx, rrx) = std::sync::mpsc::sync_channel(1);
+    let sent = cmd.send(if start {
+        plugin_core::PipelineCmd::RecordStart { reply: rtx }
+    } else {
+        plugin_core::PipelineCmd::RecordStop { reply: rtx }
+    });
+    if sent.is_err() {
+        return err_response(id, ProtocolError::new("STREAM_CLOSED", "pipeline gone"));
+    }
+    match rrx.recv_timeout(Duration::from_secs(5)) {
+        Ok(Ok(path)) => {
+            state.host.set_ui_state(p.stream_id, None, Some(start));
+            ok_response(
+                id,
+                Result_ {
+                    record: Some(RecordResult {
+                        path: path.to_string_lossy().into_owned(),
+                    }),
+                    ..Default::default()
+                },
+            )
+        }
+        Ok(Err(msg)) => {
+            err_response(id, ProtocolError::new("RECORD_FAILED", msg))
+        }
+        Err(_) => err_response(
+            id,
+            ProtocolError::new("RECORD_TIMEOUT", "pipeline did not answer in 5s"),
+        ),
+    }
 }
 
 fn snapshot_stream(state: &Arc<AppState>, id: u64, stream_id: u64) -> String {

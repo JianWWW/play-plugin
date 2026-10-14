@@ -50,11 +50,9 @@
                        Value="&quot;[INSTALLFOLDER]play-plugin.exe&quot;" />
       </Component>
 
-      <!-- FFmpeg LGPL 动态库（见 THIRD-PARTY-NOTICES；DLL 保持可替换） -->
+      <!-- FFmpeg LGPL 动态库（最小化构建：仅 avcodec/avformat/avutil/swscale/swresample；见 THIRD-PARTY-NOTICES） -->
       <Component Id="FFmpegDlls" Guid="2B3C4D5E-6F7A-4B8C-9D0E-1F2A3B4C5D6E">
         <File Source="$(var.BinDir)\avcodec-63.dll" />
-        <File Source="$(var.BinDir)\avdevice-63.dll" />
-        <File Source="$(var.BinDir)\avfilter-12.dll" />
         <File Source="$(var.BinDir)\avformat-63.dll" />
         <File Source="$(var.BinDir)\avutil-61.dll" />
         <File Source="$(var.BinDir)\swresample-7.dll" />

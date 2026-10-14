@@ -9,13 +9,17 @@ if not exist target\release\play-plugin.exe (
   exit /b 1
 )
 
-REM Stage binaries + DLLs + notices
+REM Stage binaries + DLLs + notices (minimal FFmpeg build, see .deps\build-ffmpeg-min.cmd)
 mkdir installer\staged 2>nul
+if not exist .deps\ffmpeg-min\bin\avcodec-63.dll (
+  echo [!] missing .deps\ffmpeg-min - run .deps\build-ffmpeg-min.cmd first
+  exit /b 1
+)
 copy /y target\release\play-plugin.exe installer\staged\ >nul
-copy /y .deps\ffmpeg\*\bin\*.dll installer\staged\ >nul
+for %%d in (avcodec-63 avformat-63 avutil-61 swresample-7 swscale-10) do copy /y .deps\ffmpeg-min\bin\%%d.dll installer\staged\ >nul
 copy /y installer\THIRD-PARTY-NOTICES.txt installer\staged\ >nul
 
-for /f "tokens=2" %%v in ('findstr /r "^version" Cargo.toml') do set PKGVER=%%v
+for /f "tokens=3" %%v in ('findstr /b /c:"version = " Cargo.toml') do set PKGVER=%%v
 set PKGVER=%PKGVER:"=%
 
 wix eula accept wix7 >nul 2>&1

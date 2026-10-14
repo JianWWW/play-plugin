@@ -8,7 +8,7 @@ use windows::Win32::Foundation::HANDLE;
 use windows::Win32::System::Diagnostics::Debug::{
     MiniDumpWriteDump, SetUnhandledExceptionFilter, MINIDUMP_EXCEPTION_INFORMATION, MINIDUMP_TYPE,
 };
-use windows::Win32::System::Threading::GetCurrentProcessId;
+use windows::Win32::System::Threading::{GetCurrentProcess, GetCurrentProcessId};
 
 static CRASH_DIR: OnceLock<std::path::PathBuf> = OnceLock::new();
 static CRASHED: AtomicBool = AtomicBool::new(false);
@@ -57,9 +57,10 @@ unsafe fn write_dump(
         ExceptionPointers: exception_pointers as *mut _,
         ClientPointers: false.into(),
     };
-    let handle: HANDLE = HANDLE(file.as_raw_handle());
+    // hProcess must be the pseudo-handle — passing the dump file's own
+    // handle here made every write fail silently (no .dmp ever produced).
     let _ = MiniDumpWriteDump(
-        handle,
+        GetCurrentProcess(),
         GetCurrentProcessId(),
         HANDLE(file.as_raw_handle()),
         MINIDUMP_TYPE(0),
@@ -67,4 +68,27 @@ unsafe fn write_dump(
         None,
         None,
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// End-to-end: write_dump must actually produce a non-empty .dmp.
+    /// (Before the GetCurrentProcess fix this silently wrote nothing.)
+    #[test]
+    fn dump_is_written() {
+        let dir = std::env::temp_dir().join("pp-crash-test");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let _ = CRASH_DIR.set(dir.clone());
+        unsafe { write_dump(std::ptr::null()) };
+        let dmp = std::fs::read_dir(&dir)
+            .unwrap()
+            .flatten()
+            .find(|e| e.path().extension().is_some_and(|x| x == "dmp"));
+        let size = dmp.and_then(|e| e.metadata().ok()).map(|m| m.len());
+        assert!(size.unwrap_or(0) > 0, "minidump not written");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }

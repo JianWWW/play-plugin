@@ -11,9 +11,9 @@ use windows::Win32::System::Threading::{
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DefWindowProcW, EnumWindows, GetWindowRect, GetWindowThreadProcessId,
-    IsIconic, IsWindowVisible, RegisterClassW, SetWindowLongPtrW, ShowWindow, GWL_HWNDPARENT,
-    SW_HIDE, SW_SHOWNOACTIVATE, WNDCLASSW, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST,
-    WS_POPUP,
+    IsIconic, IsWindowVisible, RegisterClassW, SetWindowLongPtrW, ShowWindow, CS_DBLCLKS,
+    GWL_HWNDPARENT, SW_HIDE, SW_SHOWNOACTIVATE, WNDCLASSW, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW,
+    WS_EX_TOPMOST, WS_POPUP,
 };
 
 pub const OVERLAY_CLASS: PCWSTR = w!("PlayPluginOverlay");
@@ -44,6 +44,8 @@ pub fn register_overlay_class() -> Result<()> {
     unsafe {
         let hinstance = GetModuleHandleW(None)?;
         let wc = WNDCLASSW {
+            // CS_DBLCLKS is required for WM_LBUTTONDBLCLK (double-click fullscreen).
+            style: CS_DBLCLKS,
             lpfnWndProc: Some(overlay_wndproc),
             hInstance: windows::Win32::Foundation::HINSTANCE(hinstance.0),
             lpszClassName: OVERLAY_CLASS,

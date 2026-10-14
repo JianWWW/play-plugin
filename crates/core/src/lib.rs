@@ -7,7 +7,7 @@ pub mod ffmpeg_backend;
 pub mod gpu;
 pub mod test_source;
 
-use std::sync::atomic::{AtomicBool, AtomicU64};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU32};
 use std::sync::Arc;
 use tokio::sync::mpsc;
 
@@ -16,6 +16,7 @@ use tokio::sync::mpsc;
 pub enum StreamState {
     Connecting,
     Playing,
+    Paused,
     Reconnecting,
     Stopped,
     Error,
@@ -70,11 +71,34 @@ pub enum PipelineEvent {
 pub struct StreamOptions {
     pub url: String,
     pub muted: bool,
+    /// Display title for the overlay top bar / recording file names.
+    pub title: String,
+}
+
+/// Commands executed on the pipeline thread (it owns the demuxer).
+pub enum PipelineCmd {
+    Seek {
+        time_ms: i64,
+        reply: std::sync::mpsc::SyncSender<Result<(), String>>,
+    },
+    RecordStart {
+        reply: std::sync::mpsc::SyncSender<Result<std::path::PathBuf, String>>,
+    },
+    RecordStop {
+        reply: std::sync::mpsc::SyncSender<Result<std::path::PathBuf, String>>,
+    },
 }
 
 pub struct PipelineHandle {
     pub close: Arc<AtomicBool>,
     pub muted: Arc<AtomicBool>,
+    /// Display freeze: keep draining the stream, skip decode/render.
+    pub paused: Arc<AtomicBool>,
+    /// Playback speed ×1000 (test source pacing).
+    pub speed_permille: Arc<AtomicU32>,
+    pub cmd_tx: std::sync::mpsc::Sender<PipelineCmd>,
+    /// Whether `speed_permille` has any effect (test/seekable sources).
+    pub speed_supported: bool,
 }
 
 /// Spawns one pipeline thread. `device` enables the zero-copy hardware decode
@@ -98,9 +122,14 @@ pub fn spawn_stream(
                 code: Some("UNSUPPORTED"),
                 message: Some("plugin built without ffmpeg backend".into()),
             });
+            let (cmd_tx, _cmd_rx) = std::sync::mpsc::channel();
             PipelineHandle {
                 close: Arc::new(AtomicBool::new(false)),
                 muted: Arc::new(AtomicBool::new(opts.muted)),
+                paused: Arc::new(AtomicBool::new(false)),
+                speed_permille: Arc::new(AtomicU32::new(1000)),
+                cmd_tx,
+                speed_supported: opts.url.starts_with("test://"),
             }
         }
     }
@@ -112,6 +141,15 @@ pub type DropCounter = Arc<AtomicU64>;
 
 pub fn new_drop_counter() -> DropCounter {
     Arc::new(AtomicU64::new(0))
+}
+
+/// Default recording directory: `%USERPROFILE%\Videos\play-plugin`.
+pub fn default_record_dir() -> std::path::PathBuf {
+    std::env::var_os("USERPROFILE")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_default()
+        .join("Videos")
+        .join("play-plugin")
 }
 
 /// Strips `user:pass@` credentials and sensitive query values (`key=`,

@@ -1,6 +1,8 @@
 # Copy to .cargo/config.toml and adjust to your machine.
-# FFmpeg shared dev build (headers + import libs + DLLs), e.g. from
-# https://www.gyan.dev/ffmpeg/builds/ (full_build-shared).
+# Preferred: minimal decode-only build produced by installer/build-ffmpeg-min.cmd
+# (see README "体积"). Fallback: official full shared build from
+# https://www.gyan.dev/ffmpeg/builds/ (headers+import libs only; MSI packaging
+# still uses the minimal DLLs).
 [env]
-FFMPEG_DIR = "C:\\path\\to\\ffmpeg-9.0-full_build-shared"
+FFMPEG_DIR = "D:\\code\\wangjian\\play-plugin\\.deps\\ffmpeg-min"
 LIBCLANG_PATH = "C:\\Program Files\\LLVM\\bin"

@@ -8,3 +8,5 @@ dist
 installer/staged
 .playwright-mcp
 sdk/.pnpm-store
+.dev-data
+bench

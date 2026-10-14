@@ -30,6 +30,15 @@ pub struct OpenParams {
     pub rect: Rect,
     #[serde(default = "default_true")]
     pub muted: bool,
+    /// Overlay top-bar title. Empty/None = no title bar.
+    #[serde(default)]
+    pub title: Option<String>,
+    /// Native control-bar buttons. None = all four.
+    #[serde(default)]
+    pub controls: Option<Vec<String>>,
+    /// Speed steps for the speed button (cycles on click).
+    #[serde(default)]
+    pub speeds: Option<Vec<f64>>,
 }
 
 fn default_true() -> bool {
@@ -58,6 +67,34 @@ pub struct SnapshotParams {
     pub stream_id: u64,
 }
 
+#[derive(Debug, Clone, Deserialize)]
+pub struct PauseParams {
+    #[serde(rename = "streamId")]
+    pub stream_id: u64,
+    pub paused: bool,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct SeekParams {
+    #[serde(rename = "streamId")]
+    pub stream_id: u64,
+    #[serde(rename = "timeMs")]
+    pub time_ms: i64,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct SpeedParams {
+    #[serde(rename = "streamId")]
+    pub stream_id: u64,
+    pub speed: f64,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct RecordParams {
+    #[serde(rename = "streamId")]
+    pub stream_id: u64,
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct HelloResult {
     pub plugin: String,
@@ -75,12 +112,31 @@ pub struct Capabilities {
     pub rtsp: bool,
     pub flv: bool,
     pub hls: bool,
+    pub rtmp: bool,
+    pub udp: bool,
     pub hardware_decode: bool,
 }
 
 #[derive(Debug, Clone, Serialize)]
 pub struct SnapshotResult {
     pub path: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct RecordResult {
+    pub path: String,
+}
+
+/// Native control-bar button press bubbled to the page as `app.control`.
+#[derive(Debug, Clone, Serialize)]
+pub struct ControlEvent {
+    #[serde(rename = "streamId")]
+    pub stream_id: u64,
+    /// "playPause" | "snapshot" | "record" | "speed"
+    pub button: String,
+    /// Speed button: the new step value.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub value: Option<f64>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -146,6 +202,8 @@ pub struct Result_ {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub snapshot: Option<SnapshotResult>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub record: Option<RecordResult>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub status: Option<StatusResult>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub pong: Option<u64>,
@@ -155,6 +213,7 @@ impl Result_ {
     pub fn is_none(&self) -> bool {
         self.hello.is_none()
             && self.snapshot.is_none()
+            && self.record.is_none()
             && self.status.is_none()
             && self.pong.is_none()
     }
@@ -209,6 +268,10 @@ impl Event {
             serde_json::to_value(p).unwrap_or_default(),
         )
     }
+
+    pub fn control(p: ControlEvent) -> Self {
+        Self::new("app.control", serde_json::to_value(p).unwrap_or_default())
+    }
 }
 
 pub fn ok_response(id: u64, result: Result_) -> String {
@@ -233,6 +296,17 @@ pub fn err_response(id: u64, error: ProtocolError) -> String {
     .unwrap_or_default()
 }
 
+/// Buttons a native control bar may show. None = all of them.
+pub fn validate_controls(controls: &[String]) -> Result<(), &'static str> {
+    const KNOWN: [&str; 4] = ["playPause", "snapshot", "record", "speed"];
+    for c in controls {
+        if !KNOWN.contains(&c.as_str()) {
+            return Err("unknown control button");
+        }
+    }
+    Ok(())
+}
+
 /// URL schemes accepted by `stream.open`.
 pub fn is_supported_url(url: &str) -> bool {
     let lower = url.to_ascii_lowercase();
@@ -240,6 +314,9 @@ pub fn is_supported_url(url: &str) -> bool {
         || lower.starts_with("rtsps://")
         || lower.starts_with("http://")
         || lower.starts_with("https://")
+        || lower.starts_with("rtmp://")
+        || lower.starts_with("rtmps://")
+        || lower.starts_with("udp://")
         || lower.starts_with("test://")
 }
 
@@ -288,8 +365,12 @@ mod tests {
         assert!(is_supported_url("RTSP://cam/stream"));
         assert!(is_supported_url("http://host/live.flv"));
         assert!(is_supported_url("test://pattern"));
+        assert!(is_supported_url("rtmp://host/live"));
+        assert!(is_supported_url("RTMPS://host/live"));
+        assert!(is_supported_url("udp://@239.1.1.1:5000"));
         assert!(!is_supported_url("file:///c:/x.mp4"));
         assert!(!is_supported_url("javascript:alert(1)"));
+        assert!(!is_supported_url("tcp://host:1234"));
     }
 
     #[test]
@@ -298,5 +379,57 @@ mod tests {
         let p: RectParams = serde_json::from_str(raw).unwrap();
         assert!(!p.hidden);
         assert_eq!(p.rect.l, -5);
+    }
+
+    #[test]
+    fn playback_params_roundtrip() {
+        let p: PauseParams =
+            serde_json::from_str(r#"{"streamId":9,"paused":true}"#).unwrap();
+        assert_eq!(p.stream_id, 9);
+        assert!(p.paused);
+
+        let s: SeekParams =
+            serde_json::from_str(r#"{"streamId":9,"timeMs":73000}"#).unwrap();
+        assert_eq!(s.time_ms, 73000);
+
+        let sp: SpeedParams =
+            serde_json::from_str(r#"{"streamId":9,"speed":4.0}"#).unwrap();
+        assert_eq!(sp.speed, 4.0);
+
+        let r: RecordParams = serde_json::from_str(r#"{"streamId":9}"#).unwrap();
+        assert_eq!(r.stream_id, 9);
+    }
+
+    #[test]
+    fn open_params_accepts_ui_config() {
+        let p: OpenParams = serde_json::from_str(
+            r#"{"streamId":1,"url":"test://x","rect":{"l":0,"t":0,"w":100,"h":50},"title":"前门枪机","controls":["playPause","speed"],"speeds":[0.5,1,2,4,8,16]}"#,
+        )
+        .unwrap();
+        assert_eq!(p.title.as_deref(), Some("前门枪机"));
+        assert!(validate_controls(p.controls.as_deref().unwrap()).is_ok());
+        assert!(validate_controls(&["playPause".into(), "nope".into()]).is_err());
+        assert!(validate_controls(&[]).is_ok());
+        assert_eq!(p.speeds.as_deref().unwrap().len(), 6);
+    }
+
+    #[test]
+    fn paused_state_serializes() {
+        let v = serde_json::to_value(plugin_core::StreamState::Paused).unwrap();
+        assert_eq!(v, "paused");
+    }
+
+    #[test]
+    fn control_event_shape() {
+        let e = Event::control(ControlEvent {
+            stream_id: 5,
+            button: "speed".into(),
+            value: Some(4.0),
+        });
+        let v: serde_json::Value = serde_json::to_value(&e).unwrap();
+        assert_eq!(v["event"], "app.control");
+        assert_eq!(v["params"]["streamId"], 5);
+        assert_eq!(v["params"]["button"], "speed");
+        assert_eq!(v["params"]["value"], 4.0);
     }
 }

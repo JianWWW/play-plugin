@@ -58,6 +58,7 @@ fn main() -> anyhow::Result<()> {
     }
 
     let (mut config, data_dir) = plugin_server::config::Config::load(config_path);
+    config.data_dir = Some(data_dir.clone());
     let _guard = init_logging(&data_dir, &config.log_level)?;
 
     if let Some(origins) = write_origins {
@@ -70,6 +71,12 @@ fn main() -> anyhow::Result<()> {
 
     crash::install(&data_dir)?;
     instance::acquire(&data_dir)?;
+
+    // Retention: drop logs/snapshots/crash files older than 7 days.
+    cleanup_before(
+        &data_dir,
+        std::time::SystemTime::now() - std::time::Duration::from_secs(7 * 86400),
+    );
 
     if smoke {
         return smoke_test(config);
@@ -134,6 +141,7 @@ fn smoke_test(_config: plugin_server::config::Config) -> anyhow::Result<()> {
             plugin_core::StreamOptions {
                 url: "test://pattern?w=960&h=540&fps=30".into(),
                 muted: true,
+                title: String::new(),
             },
             Some(host.gpu()),
             true,
@@ -159,6 +167,11 @@ fn smoke_test(_config: plugin_server::config::Config) -> anyhow::Result<()> {
                 t: gy,
                 w: 960,
                 h: 540,
+            },
+            plugin_overlay::host::UiConfig {
+                title: String::new(),
+                buttons: plugin_overlay::host::default_buttons(),
+                speeds: vec![1.0, 2.0, 4.0, 8.0, 16.0],
             },
         );
     }
@@ -195,6 +208,20 @@ fn smoke_test(_config: plugin_server::config::Config) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Deletes files under logs/, snapshots/ and crash/ modified before `cutoff`.
+fn cleanup_before(data_dir: &std::path::Path, cutoff: std::time::SystemTime) {
+    for sub in ["logs", "snapshots", "crash"] {
+        let Ok(entries) = std::fs::read_dir(data_dir.join(sub)) else { continue };
+        for e in entries.flatten() {
+            let Ok(md) = e.metadata() else { continue };
+            let old = md.is_file() && md.modified().map(|t| t < cutoff).unwrap_or(false);
+            if old {
+                let _ = std::fs::remove_file(e.path());
+            }
+        }
+    }
+}
+
 fn build_toml(config: &plugin_server::config::Config) -> String {
     let origins = config
         .origins
@@ -209,7 +236,7 @@ fn build_toml(config: &plugin_server::config::Config) -> String {
 }
 
 fn init_logging(data_dir: &std::path::Path, level: &str) -> anyhow::Result<WorkerGuard> {
-    use tracing_subscriber::layer::{Layer as _, SubscriberExt};
+    use tracing_subscriber::layer::SubscriberExt;
     use tracing_subscriber::util::SubscriberInitExt;
     std::fs::create_dir_all(data_dir.join("logs"))?;
     let (writer, guard) = tracing_appender::non_blocking(tracing_appender::rolling::daily(
@@ -220,19 +247,50 @@ fn init_logging(data_dir: &std::path::Path, level: &str) -> anyhow::Result<Worke
     let filter = tracing_subscriber::EnvFilter::try_from_default_env()
         .or_else(|_| tracing_subscriber::EnvFilter::try_new(level))
         .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"));
+    // Reloadable so pages can raise the level at runtime via hello{debug:true}
+    // (raise-only, plugin_server::logging holds the handle — ADR-0001).
+    let (filter_layer, handle) = tracing_subscriber::reload::Layer::new(filter);
+    plugin_server::logging::install(handle);
     // Console mirror for debugging: always in debug builds, opt-in otherwise.
     let console = cfg!(debug_assertions) || std::env::var_os("PLAY_PLUGIN_CONSOLE").is_some();
     let file_layer = tracing_subscriber::fmt::layer()
         .with_ansi(false)
-        .with_writer(writer)
-        .with_filter(filter.clone());
+        .with_writer(writer);
     if console {
         tracing_subscriber::registry()
+            .with(filter_layer)
             .with(file_layer)
-            .with(tracing_subscriber::fmt::layer().with_filter(filter))
+            .with(tracing_subscriber::fmt::layer())
             .init();
     } else {
-        tracing_subscriber::registry().with(file_layer).init();
+        tracing_subscriber::registry()
+            .with(filter_layer)
+            .with(file_layer)
+            .init();
     }
     Ok(guard)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn cleanup_removes_only_old_files() {
+        let dir = std::env::temp_dir().join(format!("pp-clean-{}", std::process::id()));
+        let log = dir.join("logs/play-plugin.log.2020-01-01");
+        let snap = dir.join("snapshots/stream-1-0.png");
+        std::fs::create_dir_all(log.parent().unwrap()).unwrap();
+        std::fs::create_dir_all(snap.parent().unwrap()).unwrap();
+        std::fs::write(&log, b"x").unwrap();
+        std::fs::write(&snap, b"x").unwrap();
+        // Future cutoff: everything is "old" → both deleted.
+        cleanup_before(&dir, std::time::SystemTime::now() + std::time::Duration::from_secs(1));
+        assert!(!log.exists() && !snap.exists());
+        // Epoch cutoff: nothing is old → file survives.
+        std::fs::write(&log, b"x").unwrap();
+        cleanup_before(&dir, std::time::SystemTime::UNIX_EPOCH);
+        assert!(log.exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }

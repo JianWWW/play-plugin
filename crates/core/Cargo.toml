@@ -21,6 +21,8 @@ anyhow = { workspace = true }
 [dependencies.ffmpeg-next]
 version = "9"
 optional = true
+default-features = false
+features = ["format", "software-scaling", "software-resampling"]
 
 [features]
 default = ["ffmpeg"]

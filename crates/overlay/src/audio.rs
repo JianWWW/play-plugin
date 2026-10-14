@@ -46,14 +46,13 @@ impl AudioHub {
             SinkHandle { cancel, ring }
         });
         let mut ring = handle.ring.lock().unwrap();
-        for s in chunk.samples.iter() {
-            let cap = MAX_RING;
-            if ring.len() >= cap {
-                let keep_from = cap / 4;
-                ring.drain(..keep_from); // shed backlog, keep latency bounded
-            }
-            ring.push_back(*s);
+        // Shed backlog in bulk to keep latency bounded — one check + one
+        // extend per chunk instead of per-sample capacity checks.
+        let overflow = (ring.len() + chunk.samples.len()).saturating_sub(MAX_RING);
+        if overflow > 0 {
+            ring.drain(..overflow);
         }
+        ring.extend(chunk.samples.iter().copied());
     }
 
     pub fn drop_stream(&self, stream_id: u64) {
